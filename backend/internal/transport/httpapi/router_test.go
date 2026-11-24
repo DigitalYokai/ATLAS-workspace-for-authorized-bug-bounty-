@@ -158,6 +158,55 @@ func TestEntityTagsCanBeAddedAndListed(t *testing.T) {
 	}
 }
 
+func TestGraphRespectsRelationshipLimitAndFilters(t *testing.T) {
+	h, db := newTestAPIWithDB(t)
+	created := request(t, h, http.MethodPost, "/api/v1/targets", `{"name":"Example","primaryDomain":"example.com"}`)
+	var target struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &target); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, entity := range []struct{ id, typ, value string }{{"root", "domain", "example.com"}, {"subdomain", "subdomain", "api.example.com"}, {"ip", "ip_address", "192.0.2.10"}} {
+		if _, err := db.Exec("INSERT INTO entities(id,target_id,type,canonical_value,display_value,metadata_json,scope_status,first_seen_at,last_seen_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", entity.id, target.ID, entity.typ, entity.value, entity.value, `{}`, "included", now, now, now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, edge := range []struct{ id, destination, typ string }{{"edge-one", "subdomain", "HAS_SUBDOMAIN"}, {"edge-two", "ip", "RESOLVES_TO"}} {
+		if _, err := db.Exec("INSERT INTO relationships(id,target_id,source_entity_id,destination_entity_id,relationship_type,confidence,first_seen_at,last_seen_at,status,assertion_kind,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", edge.id, target.ID, "root", edge.destination, edge.typ, 1, now, now, "current", "observed", now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	limited := request(t, h, http.MethodGet, "/api/v1/targets/"+target.ID+"/graph?rootEntityId=root&limit=1", "")
+	if limited.Code != http.StatusOK || !bytes.Contains(limited.Body.Bytes(), []byte(`"truncated":true`)) {
+		t.Fatalf("limited graph=%d %s", limited.Code, limited.Body.String())
+	}
+	filtered := request(t, h, http.MethodGet, "/api/v1/targets/"+target.ID+"/graph?rootEntityId=root&relationshipTypes=HAS_SUBDOMAIN", "")
+	if filtered.Code != http.StatusOK || bytes.Contains(filtered.Body.Bytes(), []byte("RESOLVES_TO")) || !bytes.Contains(filtered.Body.Bytes(), []byte("HAS_SUBDOMAIN")) {
+		t.Fatalf("filtered graph=%d %s", filtered.Code, filtered.Body.String())
+	}
+}
+
+func TestTargetExportIncludesObservationProvenance(t *testing.T) {
+	h := newTestAPI(t)
+	created := request(t, h, http.MethodPost, "/api/v1/targets", `{"name":"Example","primaryDomain":"example.com"}`)
+	var target struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &target); err != nil {
+		t.Fatal(err)
+	}
+	observation := request(t, h, http.MethodPost, "/api/v1/targets/"+target.ID+"/observations", `{"entityType":"technology","observationType":"manual","subject":"example.com","value":"nginx","source":"analyst","confidence":0.8,"metadata":"{}"}`)
+	if observation.Code != http.StatusCreated {
+		t.Fatalf("observation=%d %s", observation.Code, observation.Body.String())
+	}
+	exported := request(t, h, http.MethodGet, "/api/v1/targets/"+target.ID+"/exports/json", "")
+	if exported.Code != http.StatusOK || !bytes.Contains(exported.Body.Bytes(), []byte(`"source":"analyst"`)) || !bytes.Contains(exported.Body.Bytes(), []byte(`"confidence":0.8`)) || !bytes.Contains(exported.Body.Bytes(), []byte(`"scopeStatus"`)) {
+		t.Fatalf("export=%d %s", exported.Code, exported.Body.String())
+	}
+}
+
 func TestBackupDownloadProducesSQLiteDatabase(t *testing.T) {
 	h := newTestAPI(t)
 	response := request(t, h, http.MethodGet, "/api/v1/settings/backup", "")

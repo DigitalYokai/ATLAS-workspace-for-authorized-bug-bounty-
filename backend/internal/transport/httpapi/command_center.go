@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/atlas/atlas/backend/internal/schedule"
@@ -274,7 +273,12 @@ func (a *API) exportTarget(w http.ResponseWriter, r *http.Request) {
 			_ = rows.Scan(&id, &typ, &canonical, &display, &scope, &first, &last)
 			entities = append(entities, map[string]string{"id": id, "type": typ, "canonicalValue": canonical, "displayValue": display, "scopeStatus": scope, "firstSeenAt": first, "lastSeenAt": last})
 		}
-		payload := map[string]any{"generatedAt": now, "targetId": targetID, "entities": entities}
+		observations, err := a.exportObservations(r, targetID)
+		if err != nil {
+			fail(w, 500, "internal_error", "could not export observations")
+			return
+		}
+		payload := map[string]any{"generatedAt": now, "targetId": targetID, "entities": entities, "observations": observations}
 		if format == "graph" {
 			graph := httptestGraph(a, r, targetID)
 			payload["graph"] = graph
@@ -285,17 +289,18 @@ func (a *API) exportTarget(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 		w.Header().Set("Content-Disposition", "attachment; filename=atlas-assets.csv")
 		writer := csv.NewWriter(w)
-		_ = writer.Write([]string{"asset", "type", "scope_status", "first_observed", "last_observed"})
-		rows, err := a.db.QueryContext(r.Context(), "SELECT display_value,type,scope_status,first_seen_at,last_seen_at FROM entities WHERE target_id=? ORDER BY display_value", targetID)
+		_ = writer.Write([]string{"asset", "type", "scope_status", "first_observed", "last_observed", "max_confidence", "sources"})
+		rows, err := a.db.QueryContext(r.Context(), "SELECT e.display_value,e.type,e.scope_status,e.first_seen_at,e.last_seen_at,COALESCE(MAX(o.confidence),0),COALESCE(GROUP_CONCAT(DISTINCT o.source),'') FROM entities e LEFT JOIN observations o ON o.target_id=e.target_id AND lower(o.value)=lower(e.canonical_value) WHERE e.target_id=? GROUP BY e.id ORDER BY e.display_value", targetID)
 		if err != nil {
 			fail(w, 500, "internal_error", "could not export assets")
 			return
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var v, t, s, f, l string
-			_ = rows.Scan(&v, &t, &s, &f, &l)
-			_ = writer.Write([]string{v, t, s, f, l})
+			var v, t, s, f, l, sources string
+			var confidence float64
+			_ = rows.Scan(&v, &t, &s, &f, &l, &confidence, &sources)
+			_ = writer.Write([]string{v, t, s, f, l, strconv.FormatFloat(confidence, 'f', -1, 64), sources})
 		}
 		writer.Flush()
 	case "markdown":
@@ -314,6 +319,29 @@ func (a *API) exportTarget(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "validation_failed", "format must be json, csv, markdown, or graph")
 	}
 }
+
+func (a *API) exportObservations(r *http.Request, targetID string) ([]map[string]any, error) {
+	rows, err := a.db.QueryContext(r.Context(), "SELECT o.id,o.observation_type,o.subject,o.value,o.source,o.observed_at,o.confidence,o.origin,o.evidence_id,COALESCE(e.scope_status,'unknown') FROM observations o LEFT JOIN entities e ON e.target_id=o.target_id AND lower(e.canonical_value)=lower(o.value) WHERE o.target_id=? ORDER BY o.observed_at DESC", targetID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var id, typ, subject, value, source, observedAt, origin, scope string
+		var confidence float64
+		var evidenceID sql.NullString
+		if err := rows.Scan(&id, &typ, &subject, &value, &source, &observedAt, &confidence, &origin, &evidenceID, &scope); err != nil {
+			return nil, err
+		}
+		item := map[string]any{"id": id, "observationType": typ, "subject": subject, "value": value, "source": source, "observedAt": observedAt, "confidence": confidence, "origin": origin, "scopeStatus": scope}
+		if evidenceID.Valid {
+			item["evidenceId"] = evidenceID.String
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
 func httptestGraph(a *API, r *http.Request, targetID string) map[string]any {
 	rows, err := a.db.QueryContext(r.Context(), "SELECT id,source_entity_id,destination_entity_id,relationship_type,confidence,status,assertion_kind FROM relationships WHERE target_id=? LIMIT 100", targetID)
 	if err != nil {
@@ -329,6 +357,3 @@ func httptestGraph(a *API, r *http.Request, targetID string) map[string]any {
 	}
 	return map[string]any{"edges": edges}
 }
-
-var _ = sql.ErrNoRows
-var _ = strings.TrimSpace
