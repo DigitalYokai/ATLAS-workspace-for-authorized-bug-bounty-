@@ -51,6 +51,8 @@ func (a *API) routes() http.Handler {
 	m.HandleFunc("GET /api/v1/runs/{id}/events", a.runEvents)
 	m.HandleFunc("GET /api/v1/targets/{id}/entities", a.listEntities)
 	m.HandleFunc("GET /api/v1/targets/{id}/entities/{entityId}", a.getEntity)
+	m.HandleFunc("GET /api/v1/targets/{id}/observations", a.listObservations)
+	m.HandleFunc("GET /api/v1/targets/{id}/evidence/{evidenceId}", a.getEvidence)
 	return middleware(m, a.log)
 }
 func middleware(next http.Handler, log *slog.Logger) http.Handler {
@@ -382,4 +384,46 @@ func (a *API) getEntity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, 200, map[string]any{"id": id, "type": t, "canonicalValue": c, "displayValue": d, "scopeStatus": s, "metadata": json.RawMessage(metadata), "firstSeenAt": first, "lastSeenAt": last})
+}
+func (a *API) listObservations(w http.ResponseWriter, r *http.Request) {
+	if !a.ensureTarget(w, r) {
+		return
+	}
+	rows, e := a.db.QueryContext(r.Context(), "SELECT id,collector,observation_type,subject,value,source,evidence_id,observed_at,confidence,raw_metadata_json FROM observations WHERE target_id=? ORDER BY observed_at DESC LIMIT 100", r.PathValue("id"))
+	if e != nil {
+		fail(w, 500, "internal_error", "could not list observations")
+		return
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var id, c, t, subject, value, source, metadata, observed string
+		var evidence sql.NullString
+		var confidence float64
+		if e = rows.Scan(&id, &c, &t, &subject, &value, &source, &evidence, &observed, &confidence, &metadata); e != nil {
+			fail(w, 500, "internal_error", "could not read observation")
+			return
+		}
+		out = append(out, map[string]any{"id": id, "collector": c, "observationType": t, "subject": subject, "value": value, "source": source, "evidenceId": evidence, "observedAt": observed, "confidence": confidence, "metadata": json.RawMessage(metadata)})
+	}
+	write(w, 200, map[string]any{"data": out})
+}
+func (a *API) getEvidence(w http.ResponseWriter, r *http.Request) {
+	if !a.ensureTarget(w, r) {
+		return
+	}
+	var id, kind, source, hash string
+	var content sql.NullString
+	var size int
+	var collected string
+	e := a.db.QueryRowContext(r.Context(), "SELECT id,evidence_type,source,content_hash,content,content_size,collected_at FROM evidence WHERE target_id=? AND id=?", r.PathValue("id"), r.PathValue("evidenceId")).Scan(&id, &kind, &source, &hash, &content, &size, &collected)
+	if errors.Is(e, sql.ErrNoRows) {
+		fail(w, 404, "not_found", "evidence not found")
+		return
+	}
+	if e != nil {
+		fail(w, 500, "internal_error", "could not load evidence")
+		return
+	}
+	write(w, 200, map[string]any{"id": id, "type": kind, "source": source, "contentHash": hash, "content": content, "contentSize": size, "collectedAt": collected})
 }

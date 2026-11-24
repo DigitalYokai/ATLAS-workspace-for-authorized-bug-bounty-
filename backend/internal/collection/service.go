@@ -51,6 +51,13 @@ func (s *Service) Start(ctx context.Context, targetID string, in CreateInput) (R
 	if e != nil {
 		return Run{}, e
 	}
+	if in.Configuration.RateLimitPerMinute < 1 {
+		if t.RateLimitPerMinute != nil {
+			in.Configuration.RateLimitPerMinute = *t.RateLimitPerMinute
+		} else {
+			in.Configuration.RateLimitPerMinute = 30
+		}
+	}
 	rules, e := s.scopes.List(ctx, targetID)
 	if e != nil {
 		return Run{}, e

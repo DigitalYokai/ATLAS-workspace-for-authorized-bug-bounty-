@@ -68,3 +68,45 @@ At the end of each implementation, report:
 - Tests executed and their actual results.
 - Known limitations.
 - Remaining work.
+
+## Autonomous Execution Policy
+
+Operate autonomously throughout the assigned implementation phase.
+
+Read the relevant architecture, design and phase specifications before implementation.
+
+Break the phase into actionable tasks and execute them sequentially.
+
+Do not stop after completing individual tasks or milestones.
+
+Do not request confirmation before ordinary implementation decisions.
+
+Resolve compilation errors, failing tests, dependency issues and configuration problems independently.
+
+Run tests and verification continuously.
+
+Update documentation whenever implementation changes require it.
+
+Treat progress reports as informational, not as requests for permission to continue.
+
+Never substitute a proposed implementation plan for actual implementation.
+
+Do not leave mandatory functionality unfinished merely because a substantial portion has been implemented.
+
+Only stop and request user input when:
+
+A fundamental architectural decision is required.
+
+Requirements are contradictory.
+
+Required credentials or external resources are unavailable.
+
+An irreversible or destructive operation requires authorization.
+
+A genuine blocker cannot be resolved independently.
+
+Continue until every mandatory acceptance criterion for the assigned phase has been implemented and verified.
+
+Do not proceed beyond the assigned phase unless explicitly authorized.
+
+When finished, provide a consolidated report containing implemented functionality, test results, acceptance criteria and remaining limitations.

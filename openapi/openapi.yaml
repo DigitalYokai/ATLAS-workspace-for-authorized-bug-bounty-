@@ -10,3 +10,16 @@ paths:
   /api/v1/targets/{id}/scope:
     get: {summary: List scope rules, responses: {'200': {description: OK}}}
     put: {summary: Replace scope rules, responses: {'200': {description: OK}}}
+  /api/v1/targets/{id}/runs:
+    get: {summary: List collection runs, responses: {'200': {description: OK}}}
+    post: {summary: Queue a collection run, responses: {'202': {description: Accepted}, '400': {description: Invalid or unauthorized request}}}
+  /api/v1/runs/{id}:
+    get: {summary: Inspect collection run, responses: {'200': {description: OK}}}
+  /api/v1/runs/{id}/cancel:
+    post: {summary: Cancel a running collection run, responses: {'202': {description: Accepted}}}
+  /api/v1/runs/{id}/events:
+    get: {summary: Stream persisted collection progress over SSE, responses: {'200': {description: Event stream}}}
+  /api/v1/targets/{id}/entities:
+    get: {summary: List target assets, responses: {'200': {description: OK}}}
+  /api/v1/targets/{id}/observations:
+    get: {summary: List target observations, responses: {'200': {description: OK}}}

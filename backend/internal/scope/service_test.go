@@ -17,3 +17,10 @@ func TestWildcardMatchingAndExclusionPrecedence(t *testing.T) {
 		t.Fatalf("wildcard crossed label boundary: %#v", got)
 	}
 }
+
+func TestNormalizeHostAcceptsCIANDT(t *testing.T) {
+	got, err := NormalizeHost("ciandt.com")
+	if err != nil || got != "ciandt.com" {
+		t.Fatalf("valid hostname rejected: got=%q err=%v", got, err)
+	}
+}
