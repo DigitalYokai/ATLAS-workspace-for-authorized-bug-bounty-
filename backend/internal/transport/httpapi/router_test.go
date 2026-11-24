@@ -157,3 +157,14 @@ func TestEntityTagsCanBeAddedAndListed(t *testing.T) {
 		t.Fatalf("tags response=%s", listed.Body.String())
 	}
 }
+
+func TestBackupDownloadProducesSQLiteDatabase(t *testing.T) {
+	h := newTestAPI(t)
+	response := request(t, h, http.MethodGet, "/api/v1/settings/backup", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("backup status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response.Body.Len() < 100 || response.Header().Get("Content-Disposition") == "" {
+		t.Fatalf("invalid backup response: bytes=%d headers=%v", response.Body.Len(), response.Header())
+	}
+}

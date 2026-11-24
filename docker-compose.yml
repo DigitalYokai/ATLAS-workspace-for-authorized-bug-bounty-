@@ -4,6 +4,8 @@ services:
     environment:
       ATLAS_ADDR: 0.0.0.0:8080
       ATLAS_DATABASE_URL: /data/atlas.db
+      ATLAS_ADMIN_USERNAME: ${ATLAS_ADMIN_USERNAME:?Set ATLAS_ADMIN_USERNAME in .env}
+      ATLAS_ADMIN_PASSWORD: ${ATLAS_ADMIN_PASSWORD:?Set ATLAS_ADMIN_PASSWORD in .env}
     ports: ["127.0.0.1:8080:8080"]
     volumes: ["atlas-data:/data"]
   web:

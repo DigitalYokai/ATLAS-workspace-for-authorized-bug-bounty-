@@ -6,10 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/atlas/atlas/backend/internal/activity"
+	"github.com/atlas/atlas/backend/internal/auth"
 	"github.com/atlas/atlas/backend/internal/collection"
 	"github.com/atlas/atlas/backend/internal/correlation"
 	"github.com/atlas/atlas/backend/internal/investigation"
+	"github.com/atlas/atlas/backend/internal/notification"
 	"github.com/atlas/atlas/backend/internal/observation"
+	"github.com/atlas/atlas/backend/internal/schedule"
 	"github.com/atlas/atlas/backend/internal/scope"
 	"github.com/atlas/atlas/backend/internal/target"
 	"log/slog"
@@ -20,14 +24,18 @@ import (
 )
 
 type API struct {
-	db          *sql.DB
-	targets     *target.Service
-	scopes      *scope.Repository
-	notes       *investigation.Repository
-	ingest      *observation.Ingestor
-	runs        *collection.Service
-	correlation *correlation.Service
-	log         *slog.Logger
+	db            *sql.DB
+	targets       *target.Service
+	scopes        *scope.Repository
+	notes         *investigation.Repository
+	ingest        *observation.Ingestor
+	runs          *collection.Service
+	correlation   *correlation.Service
+	auth          *auth.Service
+	activity      *activity.Service
+	notifications *notification.Service
+	schedules     *schedule.Service
+	log           *slog.Logger
 }
 
 func New(db *sql.DB, log *slog.Logger) http.Handler {
@@ -35,17 +43,30 @@ func New(db *sql.DB, log *slog.Logger) http.Handler {
 	tr := target.NewRepository(db)
 	runs := collection.NewService(db, []collection.Collector{collection.DNSCollector{}, collection.HTTPMetadataCollector{}, collection.TLSCollector{}, collection.CTCollector{}})
 	corr := correlation.NewService(db)
-	runs.SetCompletionProcessor(func(ctx context.Context, run collection.Run) error { return corr.QueueRun(ctx, run.TargetID, run.ID) })
-	api := &API{db: db, targets: target.NewService(db, tr, sc), scopes: sc, notes: investigation.NewRepository(db), ingest: observation.NewIngestor(db, sc), runs: runs, correlation: corr, log: log}
+	activities := activity.NewService(db)
+	notices := notification.NewService(db)
+	runs.SetCompletionProcessor(func(ctx context.Context, run collection.Run) error {
+		_ = activities.Record(ctx, &run.TargetID, "collection_finished", "run", run.ID, "Collection run "+string(run.Status))
+		if run.Status == collection.Failed {
+			_ = notices.Create(ctx, &run.TargetID, "collection_failed", "run:"+run.ID, "Collection failed", "A collection run failed", "/targets/"+run.TargetID+"/runs")
+		}
+		return corr.QueueRun(ctx, run.TargetID, run.ID)
+	})
+	api := &API{db: db, targets: target.NewService(db, tr, sc), scopes: sc, notes: investigation.NewRepository(db), ingest: observation.NewIngestor(db, sc), runs: runs, correlation: corr, auth: auth.NewService(db), activity: activities, notifications: notices, schedules: schedule.NewService(db, runs), log: log}
 	return api.routes()
 }
 func (a *API) routes() http.Handler {
 	m := http.NewServeMux()
 	m.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { write(w, 200, map[string]string{"status": "ok"}) })
+	m.HandleFunc("POST /api/v1/auth/login", a.login)
+	m.HandleFunc("POST /api/v1/auth/logout", a.logout)
+	m.HandleFunc("GET /api/v1/auth/me", a.me)
+	m.HandleFunc("GET /api/v1/auth/csrf", a.csrf)
 	m.HandleFunc("GET /api/v1/dashboard", a.dashboard)
 	m.HandleFunc("GET /api/v1/targets", a.listTargets)
 	m.HandleFunc("POST /api/v1/targets", a.createTarget)
 	m.HandleFunc("GET /api/v1/targets/{id}", a.getTarget)
+	m.HandleFunc("GET /api/v1/targets/{id}/dashboard", a.targetDashboard)
 	m.HandleFunc("PATCH /api/v1/targets/{id}", a.patchTarget)
 	m.HandleFunc("GET /api/v1/targets/{id}/scope", a.listScope)
 	m.HandleFunc("PUT /api/v1/targets/{id}/scope", a.replaceScope)
@@ -73,18 +94,57 @@ func (a *API) routes() http.Handler {
 	m.HandleFunc("GET /api/v1/targets/{id}/snapshots/compare", a.compareSnapshots)
 	m.HandleFunc("GET /api/v1/targets/{id}/observations", a.listObservations)
 	m.HandleFunc("GET /api/v1/targets/{id}/evidence/{evidenceId}", a.getEvidence)
-	return middleware(m, a.log)
+	m.HandleFunc("GET /api/v1/activity", a.listActivity)
+	m.HandleFunc("GET /api/v1/targets/{id}/activity", a.listActivity)
+	m.HandleFunc("GET /api/v1/notifications", a.listNotifications)
+	m.HandleFunc("PATCH /api/v1/notifications/{notificationId}", a.updateNotification)
+	m.HandleFunc("GET /api/v1/targets/{id}/schedules", a.listSchedules)
+	m.HandleFunc("POST /api/v1/targets/{id}/schedules", a.createSchedule)
+	m.HandleFunc("PATCH /api/v1/targets/{id}/schedules/{scheduleId}", a.updateSchedule)
+	m.HandleFunc("GET /api/v1/settings", a.getSettings)
+	m.HandleFunc("PATCH /api/v1/settings", a.updateSettings)
+	m.HandleFunc("GET /api/v1/settings/backup", a.downloadBackup)
+	m.HandleFunc("GET /api/v1/targets/{id}/exports/{format}", a.exportTarget)
+	return middleware(m, a.log, a.auth)
 }
-func middleware(next http.Handler, log *slog.Logger) http.Handler {
+func middleware(next http.Handler, log *slog.Logger, sessions *auth.Service) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:5173")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type,X-CSRF-Token")
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(204)
 			return
+		}
+		if r.URL.Path == "/healthz" || r.URL.Path == "/api/v1/auth/login" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		required, err := sessions.Required(r.Context())
+		if err != nil {
+			fail(w, 500, "internal_error", "could not check authentication")
+			return
+		}
+		if required {
+			cookie, cookieErr := r.Cookie(auth.SessionCookie)
+			if cookieErr != nil {
+				fail(w, 401, "unauthorized", "login required")
+				return
+			}
+			session, sessionErr := sessions.Session(r.Context(), cookie.Value)
+			if sessionErr != nil {
+				fail(w, 401, "unauthorized", "invalid or expired session")
+				return
+			}
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				if r.Header.Get("X-CSRF-Token") != session.CSRFToken {
+					fail(w, 403, "csrf_failed", "valid CSRF token required")
+					return
+				}
+			}
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -238,7 +298,16 @@ func (a *API) dashboard(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, "internal_error", "could not load dashboard")
 		return
 	}
-	write(w, 200, map[string]any{"activeTargetCount": len(items), "recentTargets": items})
+	var entities, reviewed int
+	if e = a.db.QueryRowContext(r.Context(), "SELECT count(*) FROM entities").Scan(&entities); e != nil {
+		fail(w, 500, "internal_error", "could not load dashboard metrics")
+		return
+	}
+	if e = a.db.QueryRowContext(r.Context(), "SELECT count(*) FROM entities WHERE investigation_status IN ('reviewed','archived')").Scan(&reviewed); e != nil {
+		fail(w, 500, "internal_error", "could not load dashboard metrics")
+		return
+	}
+	write(w, 200, map[string]any{"activeTargetCount": len(items), "totalEntityCount": entities, "reviewedEntityCount": reviewed, "recentTargets": items})
 }
 func (a *API) listNotes(w http.ResponseWriter, r *http.Request) {
 	if !a.ensureTarget(w, r) {
@@ -296,6 +365,7 @@ func (a *API) createRun(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "validation_failed", e.Error())
 		return
 	}
+	_ = a.activity.Record(r.Context(), ptr(run.TargetID), "collection_started", "run", run.ID, "Collection run started")
 	write(w, 202, run)
 }
 func (a *API) getRun(w http.ResponseWriter, r *http.Request) {

@@ -222,7 +222,10 @@ func (a *API) graph(w http.ResponseWriter, r *http.Request) {
 	if !a.ensureTarget(w, r) {
 		return
 	}
-	entityID := r.URL.Query().Get("entityId")
+	entityID := r.URL.Query().Get("rootEntityId")
+	if entityID == "" {
+		entityID = r.URL.Query().Get("entityId")
+	}
 	if entityID == "" {
 		fail(w, 400, "validation_failed", "entityId is required")
 		return
@@ -232,26 +235,94 @@ func (a *API) graph(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "validation_failed", err.Error())
 		return
 	}
-	rows, err := a.db.QueryContext(r.Context(), "SELECT id,target_id,source_entity_id,destination_entity_id,relationship_type,confidence,first_seen_at,last_seen_at,status,assertion_kind FROM relationships WHERE target_id=? AND (? IN (source_entity_id,destination_entity_id)) ORDER BY last_seen_at DESC LIMIT ?", r.PathValue("id"), entityID, limit)
-	if err != nil {
-		fail(w, 500, "internal_error", "could not load graph")
-		return
-	}
-	defer rows.Close()
-	edges := []correlation.Relationship{}
-	nodeIDs := map[string]bool{}
-	for rows.Next() {
-		var edge correlation.Relationship
-		var first, last string
-		if err = rows.Scan(&edge.ID, &edge.TargetID, &edge.SourceEntityID, &edge.DestinationEntityID, &edge.RelationshipType, &edge.Confidence, &first, &last, &edge.Status, &edge.AssertionKind); err != nil {
-			fail(w, 500, "internal_error", "could not read graph")
+	depth := 1
+	if raw := r.URL.Query().Get("depth"); raw != "" {
+		depth, err = strconv.Atoi(raw)
+		if err != nil || depth < 1 || depth > 2 {
+			fail(w, 400, "validation_failed", "depth must be 1 or 2")
 			return
 		}
-		edge.FirstSeenAt, _ = time.Parse(time.RFC3339Nano, first)
-		edge.LastSeenAt, _ = time.Parse(time.RFC3339Nano, last)
-		edges = append(edges, edge)
-		nodeIDs[edge.SourceEntityID] = true
-		nodeIDs[edge.DestinationEntityID] = true
+	}
+	var exists int
+	if err := a.db.QueryRowContext(r.Context(), "SELECT 1 FROM entities WHERE target_id=? AND id=?", r.PathValue("id"), entityID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+		fail(w, 404, "not_found", "entity not found")
+		return
+	} else if err != nil {
+		fail(w, 500, "internal_error", "could not load graph root")
+		return
+	}
+	edges := []correlation.Relationship{}
+	nodeIDs := map[string]bool{entityID: true}
+	frontier := []string{entityID}
+	entityTypes := strings.Split(strings.Trim(r.URL.Query().Get("entityTypes"), ","), ",")
+	relationshipTypes := strings.Split(strings.Trim(r.URL.Query().Get("relationshipTypes"), ","), ",")
+	allowedEntity := map[string]bool{}
+	for _, typ := range entityTypes {
+		if typ != "" {
+			allowedEntity[typ] = true
+		}
+	}
+	allowedRelationship := map[string]bool{}
+	for _, typ := range relationshipTypes {
+		if typ != "" {
+			allowedRelationship[typ] = true
+		}
+	}
+	for level := 0; level < depth && len(frontier) > 0 && len(edges) < limit; level++ {
+		next := []string{}
+		for _, nodeID := range frontier {
+			if len(edges) >= limit {
+				break
+			}
+			rows, queryErr := a.db.QueryContext(r.Context(), "SELECT id,target_id,source_entity_id,destination_entity_id,relationship_type,confidence,first_seen_at,last_seen_at,status,assertion_kind FROM relationships WHERE target_id=? AND (? IN (source_entity_id,destination_entity_id)) ORDER BY last_seen_at DESC LIMIT ?", r.PathValue("id"), nodeID, limit-len(edges))
+			if queryErr != nil {
+				fail(w, 500, "internal_error", "could not load graph")
+				return
+			}
+			for rows.Next() {
+				var edge correlation.Relationship
+				var first, last string
+				if queryErr = rows.Scan(&edge.ID, &edge.TargetID, &edge.SourceEntityID, &edge.DestinationEntityID, &edge.RelationshipType, &edge.Confidence, &first, &last, &edge.Status, &edge.AssertionKind); queryErr != nil {
+					rows.Close()
+					fail(w, 500, "internal_error", "could not read graph")
+					return
+				}
+				if allowedRelationship[edge.RelationshipType] == false && len(allowedRelationship) > 0 {
+					continue
+				}
+				other := edge.SourceEntityID
+				if other == nodeID {
+					other = edge.DestinationEntityID
+				}
+				if len(allowedEntity) > 0 {
+					var typ string
+					if queryErr = a.db.QueryRowContext(r.Context(), "SELECT type FROM entities WHERE target_id=? AND id=?", r.PathValue("id"), other).Scan(&typ); queryErr != nil || !allowedEntity[typ] {
+						continue
+					}
+				}
+				duplicate := false
+				for _, present := range edges {
+					if present.ID == edge.ID {
+						duplicate = true
+						break
+					}
+				}
+				if duplicate {
+					continue
+				}
+				edge.FirstSeenAt, _ = time.Parse(time.RFC3339Nano, first)
+				edge.LastSeenAt, _ = time.Parse(time.RFC3339Nano, last)
+				wasKnown := nodeIDs[other]
+				edges = append(edges, edge)
+				nodeIDs[edge.SourceEntityID] = true
+				nodeIDs[edge.DestinationEntityID] = true
+				if !wasKnown {
+					next = append(next, other)
+				}
+			}
+			rows.Close()
+		}
+		frontier = next
 	}
 	nodes := []correlation.Node{}
 	for id := range nodeIDs {
@@ -260,7 +331,7 @@ func (a *API) graph(w http.ResponseWriter, r *http.Request) {
 			nodes = append(nodes, n)
 		}
 	}
-	write(w, 200, correlation.Graph{Nodes: nodes, Edges: edges})
+	write(w, 200, map[string]any{"nodes": nodes, "edges": edges, "truncated": len(edges) >= limit})
 }
 
 func (a *API) createManualObservation(w http.ResponseWriter, r *http.Request) {

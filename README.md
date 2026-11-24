@@ -5,10 +5,14 @@ ATLAS is a self-hosted intelligence workspace for authorized bug bounty research
 ## Run
 
 ```sh
+cp .env.example .env
+# edit .env and choose a unique password of at least 12 characters
 docker compose up --build
 ```
 
 Open http://localhost:5173. SQLite data is retained in the `atlas-data` Docker volume. The API is at http://localhost:8080 and is bound to localhost.
+
+ATLAS now requires local login. The first administrator is created from `ATLAS_ADMIN_USERNAME` and `ATLAS_ADMIN_PASSWORD`; those values are only used to bootstrap an empty database. Use the command center to explore bounded knowledge-graph neighborhoods, configure passive DNS/CT monitoring, review activity, and export target intelligence.
 
 ## Development
 

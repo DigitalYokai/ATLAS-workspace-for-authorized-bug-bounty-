@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"github.com/atlas/atlas/backend/internal/auth"
 	"github.com/atlas/atlas/backend/internal/platform/database"
 	"github.com/atlas/atlas/backend/internal/transport/httpapi"
 	"log/slog"
@@ -23,6 +24,10 @@ func main() {
 		os.Exit(1)
 	}
 	defer db.Close()
+	if err := auth.BootstrapFromEnvironment(ctx, db); err != nil {
+		log.Error("authentication bootstrap failed", "error", err)
+		os.Exit(1)
+	}
 	addr := os.Getenv("ATLAS_ADDR")
 	if addr == "" {
 		addr = "127.0.0.1:8080"
