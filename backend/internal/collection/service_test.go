@@ -3,6 +3,7 @@ package collection
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"github.com/atlas/atlas/backend/internal/platform/database"
 	"github.com/google/uuid"
 	"path/filepath"
@@ -30,6 +31,59 @@ func (c blockingCollector) Collect(ctx context.Context, _ Request, emit func(Obs
 	case <-time.After(40 * time.Millisecond):
 		return emit(Observation{EntityType: "technology", Value: "fixture", Source: "blocking", Confidence: 1, Metadata: "{}", ObservedAt: time.Now().UTC()})
 	}
+}
+
+func TestCancelRunningCollection(t *testing.T) {
+	db := setupCollectionDB(t)
+	var current, max int32
+	s := NewService(db, []Collector{blockingCollector{&current, &max}})
+	run, err := s.Start(context.Background(), "target", CreateInput{Collectors: []string{"blocking"}, Mode: Passive, Configuration: Configuration{Concurrency: 1, TimeoutSeconds: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for atomic.LoadInt32(&current) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !s.Cancel(run.ID) {
+		t.Fatal("expected cancellation handle")
+	}
+	for time.Now().Before(deadline) {
+		got, _ := s.Get(context.Background(), run.ID)
+		if got.Status == Cancelled {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	got, _ := s.Get(context.Background(), run.ID)
+	t.Fatalf("status=%s", got.Status)
+}
+
+func TestCancelPersistsForUnknownWorker(t *testing.T) {
+	db := setupCollectionDB(t)
+	s := NewService(db, nil)
+	run, err := s.repo.Create(context.Background(), "target", CreateInput{Collectors: []string{"fixture"}, Mode: Passive, Configuration: Configuration{Concurrency: 1, TimeoutSeconds: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.Cancel(run.ID) {
+		t.Fatal("expected durable cancellation")
+	}
+	got, err := s.Get(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != Cancelled {
+		t.Fatalf("status=%s", got.Status)
+	}
+}
+
+type failingCollector struct{}
+
+func (failingCollector) Name() string { return "failing" }
+func (failingCollector) Active() bool { return false }
+func (failingCollector) Collect(context.Context, Request, func(Observation) error) error {
+	return fmt.Errorf("fixture failure")
 }
 func setupCollectionDB(t *testing.T) *sql.DB {
 	t.Helper()
@@ -72,5 +126,33 @@ func TestRunPersistsCollectedObservation(t *testing.T) {
 	}
 	if atomic.LoadInt32(&max) > 1 {
 		t.Fatalf("worker concurrency exceeded: %d", max)
+	}
+}
+func TestPartialFailurePreservesSuccessfulObservation(t *testing.T) {
+	db := setupCollectionDB(t)
+	var current, max int32
+	s := NewService(db, []Collector{blockingCollector{&current, &max}, failingCollector{}})
+	run, e := s.Start(context.Background(), "target", CreateInput{Collectors: []string{"blocking", "failing"}, Mode: Passive, Configuration: Configuration{Concurrency: 2, TimeoutSeconds: 2}})
+	if e != nil {
+		t.Fatal(e)
+	}
+	deadline := time.Now().Add(time.Second)
+	var got Run
+	for time.Now().Before(deadline) {
+		got, _ = s.Get(context.Background(), run.ID)
+		if got.Status == PartiallyCompleted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got.Status != PartiallyCompleted {
+		t.Fatalf("status=%s", got.Status)
+	}
+	var count int
+	if e := db.QueryRow("SELECT count(*) FROM observations WHERE collection_run_id=?", run.ID).Scan(&count); e != nil {
+		t.Fatal(e)
+	}
+	if count != 1 {
+		t.Fatalf("successful observation lost: %d", count)
 	}
 }

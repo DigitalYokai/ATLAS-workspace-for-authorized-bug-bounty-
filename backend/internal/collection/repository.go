@@ -139,3 +139,40 @@ func (r *Repository) Events(ctx context.Context, runID string, after string) ([]
 	}
 	return out, rows.Err()
 }
+
+func (r *Repository) RecoverInterrupted(ctx context.Context) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, e := r.db.BeginTx(ctx, nil)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	if _, e = tx.ExecContext(ctx, "UPDATE collection_jobs SET status='pending',error_summary='',started_at=NULL,updated_at=? WHERE status='running'", now); e != nil {
+		return e
+	}
+	if _, e = tx.ExecContext(ctx, "UPDATE collection_runs SET status='pending',started_at=NULL,updated_at=? WHERE status='running'", now); e != nil {
+		return e
+	}
+	return tx.Commit()
+}
+
+func (r *Repository) Cancel(ctx context.Context, runID string) (bool, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, e := r.db.BeginTx(ctx, nil)
+	if e != nil {
+		return false, e
+	}
+	defer tx.Rollback()
+	result, e := tx.ExecContext(ctx, "UPDATE collection_runs SET status='cancelled',completed_at=?,updated_at=? WHERE id=? AND status IN ('pending','running')", now, now, runID)
+	if e != nil {
+		return false, e
+	}
+	changed, _ := result.RowsAffected()
+	if changed == 0 {
+		return false, tx.Commit()
+	}
+	if _, e = tx.ExecContext(ctx, "UPDATE collection_jobs SET status='cancelled',completed_at=?,updated_at=?,error_summary='cancelled' WHERE run_id=? AND status IN ('pending','running')", now, now, runID); e != nil {
+		return false, e
+	}
+	return true, tx.Commit()
+}

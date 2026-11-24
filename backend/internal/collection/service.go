@@ -17,19 +17,22 @@ type Service struct {
 	scopes     *scope.Repository
 	ingest     *observation.Ingestor
 	collectors map[string]Collector
+	globalSem  chan struct{}
 	mu         sync.Mutex
 	cancels    map[string]context.CancelFunc
 }
 
 func NewService(db *sql.DB, collectors []Collector) *Service {
 	sr := scope.NewRepository(db)
-	return &Service{repo: NewRepository(db), targets: target.NewRepository(db), scopes: sr, ingest: observation.NewIngestor(db, sr), collectors: func() map[string]Collector {
+	svc := &Service{repo: NewRepository(db), targets: target.NewRepository(db), scopes: sr, ingest: observation.NewIngestor(db, sr), collectors: func() map[string]Collector {
 		m := map[string]Collector{}
 		for _, c := range collectors {
 			m[c.Name()] = c
 		}
 		return m
-	}(), cancels: map[string]context.CancelFunc{}}
+	}(), globalSem: make(chan struct{}, 4), cancels: map[string]context.CancelFunc{}}
+	_ = svc.repo.RecoverInterrupted(context.Background())
+	return svc
 }
 func (s *Service) Start(ctx context.Context, targetID string, in CreateInput) (Run, error) {
 	if in.Mode == "" {
@@ -71,7 +74,11 @@ func (s *Service) Start(ctx context.Context, targetID string, in CreateInput) (R
 			if in.Mode != Active {
 				return Run{}, fmt.Errorf("collector %q requires active mode", name)
 			}
-			if !scope.Evaluate(rules, t.PrimaryDomain, "http_probe").ActiveApproved {
+			method := "http_probe"
+			if active, ok := c.(ActiveCollector); ok {
+				method = active.ScopeMethod()
+			}
+			if !scope.Evaluate(rules, t.PrimaryDomain, method).ActiveApproved {
 				return Run{}, fmt.Errorf("active collection denied by scope")
 			}
 		}
@@ -93,6 +100,14 @@ func (s *Service) execute(run Run, domain string, rules []scope.Rule) {
 	_ = s.repo.AddEvent(ctx, run.TargetID, run.ID, "run_started", "Collection run started")
 	jobs, _ := s.repo.Jobs(ctx, run.ID)
 	sem := make(chan struct{}, run.Configuration.Concurrency)
+	var rateTicker *time.Ticker
+	var rateGate <-chan time.Time
+	if run.Mode == Active && run.Configuration.RateLimitPerMinute > 0 {
+		interval := time.Minute / time.Duration(run.Configuration.RateLimitPerMinute)
+		rateTicker = time.NewTicker(interval)
+		rateGate = rateTicker.C
+		defer rateTicker.Stop()
+	}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	done, failed := 0, 0
@@ -103,12 +118,21 @@ func (s *Service) execute(run Run, domain string, rules []scope.Rule) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			s.globalSem <- struct{}{}
+			defer func() { <-s.globalSem }()
 			if ctx.Err() != nil {
 				_ = s.repo.SetJob(ctx, job.ID, Cancelled, "cancelled")
 				return
 			}
 			_ = s.repo.SetJob(ctx, job.ID, Running, "")
 			c := s.collectors[job.CollectorName]
+			if c.Active() && rateGate != nil {
+				select {
+				case <-ctx.Done():
+					return
+				case <-rateGate:
+				}
+			}
 			cctx, stop := context.WithTimeout(ctx, time.Duration(run.Configuration.TimeoutSeconds)*time.Second)
 			err := c.Collect(cctx, Request{TargetID: run.TargetID, PrimaryDomain: domain, Mode: run.Mode, Rules: rules, Configuration: run.Configuration}, func(o Observation) error {
 				return s.ingest.Ingest(cctx, run.TargetID, run.ID, observation.Input{EntityType: o.EntityType, Value: o.Value, Source: o.Source, Confidence: o.Confidence, Metadata: o.Metadata, Evidence: o.Evidence, ObservedAt: o.ObservedAt})
@@ -141,12 +165,13 @@ func (s *Service) execute(run Run, domain string, rules []scope.Rule) {
 }
 func (s *Service) Cancel(id string) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	c, ok := s.cancels[id]
 	if ok {
 		c()
 	}
-	return ok
+	s.mu.Unlock()
+	persisted, err := s.repo.Cancel(context.Background(), id)
+	return err == nil && (ok || persisted)
 }
 func (s *Service) Get(ctx context.Context, id string) (Run, error) { return s.repo.Get(ctx, id) }
 func (s *Service) List(ctx context.Context, targetID string) ([]Run, error) {

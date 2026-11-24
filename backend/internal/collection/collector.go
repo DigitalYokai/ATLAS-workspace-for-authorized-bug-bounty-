@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -35,6 +36,10 @@ type Collector interface {
 	Name() string
 	Active() bool
 	Collect(context.Context, Request, func(Observation) error) error
+}
+type ActiveCollector interface {
+	Collector
+	ScopeMethod() string
 }
 type DNSLookup func(context.Context, string) ([]net.IP, error)
 
@@ -67,8 +72,9 @@ type HTTPMetadataCollector struct {
 	Resolve DNSLookup
 }
 
-func (c HTTPMetadataCollector) Name() string { return "http_metadata" }
-func (c HTTPMetadataCollector) Active() bool { return true }
+func (c HTTPMetadataCollector) Name() string        { return "http_metadata" }
+func (c HTTPMetadataCollector) Active() bool        { return true }
+func (c HTTPMetadataCollector) ScopeMethod() string { return "http_probe" }
 func (c HTTPMetadataCollector) Collect(ctx context.Context, r Request, emit func(Observation) error) error {
 	if decision := scope.Evaluate(r.Rules, r.PrimaryDomain, "http_probe"); !decision.ActiveApproved {
 		return fmt.Errorf("scope denied HTTP collection: %s", decision.Reason)
@@ -111,6 +117,16 @@ func (c HTTPMetadataCollector) Collect(ctx context.Context, r Request, emit func
 			return err
 		}
 	}
+	// Inspect only a bounded, escaped-text-compatible prefix; never execute external content.
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if readErr != nil {
+		return fmt.Errorf("read bounded response metadata: %w", readErr)
+	}
+	if match := regexp.MustCompile(`(?i)<meta[^>]+name=["']generator["'][^>]+content=["']([^"']+)`).FindSubmatch(body); len(match) == 2 {
+		if err := emit(Observation{EntityType: "technology", Value: string(match[1]), Source: c.Name(), Confidence: .7, ObservedAt: time.Now().UTC(), Metadata: `{"source":"meta_generator","classification":"inferred"}`}); err != nil {
+			return err
+		}
+	}
 	return emit(Observation{EntityType: "url", Value: u.String(), Source: c.Name(), Confidence: 1, ObservedAt: time.Now().UTC(), Metadata: fmt.Sprintf(`{"status":%d}`, resp.StatusCode)})
 }
 
@@ -122,8 +138,9 @@ func (r resolverAdapter) LookupIP(ctx context.Context, host string) ([]net.IP, e
 
 type TLSCollector struct{ Resolve DNSLookup }
 
-func (c TLSCollector) Name() string { return "tls_metadata" }
-func (c TLSCollector) Active() bool { return true }
+func (c TLSCollector) Name() string        { return "tls_metadata" }
+func (c TLSCollector) Active() bool        { return true }
+func (c TLSCollector) ScopeMethod() string { return "tls_handshake" }
 func (c TLSCollector) Collect(ctx context.Context, r Request, emit func(Observation) error) error {
 	if d := scope.Evaluate(r.Rules, r.PrimaryDomain, "tls_handshake"); !d.ActiveApproved {
 		return fmt.Errorf("scope denied TLS collection: %s", d.Reason)
@@ -135,9 +152,14 @@ func (c TLSCollector) Collect(ctx context.Context, r Request, emit func(Observat
 	if err := network.PublicDestination(ctx, resolver, r.PrimaryDomain); err != nil {
 		return err
 	}
-	conn, err := tls.DialWithDialer(&net.Dialer{}, "tcp", net.JoinHostPort(r.PrimaryDomain, "443"), &tls.Config{ServerName: r.PrimaryDomain, MinVersion: tls.VersionTLS12})
+	rawConn, err := (&tls.Dialer{NetDialer: &net.Dialer{}, Config: &tls.Config{ServerName: r.PrimaryDomain, MinVersion: tls.VersionTLS12}}).DialContext(ctx, "tcp", net.JoinHostPort(r.PrimaryDomain, "443"))
 	if err != nil {
 		return err
+	}
+	conn, ok := rawConn.(*tls.Conn)
+	if !ok {
+		_ = rawConn.Close()
+		return fmt.Errorf("TLS dialer returned unexpected connection type")
 	}
 	defer conn.Close()
 	if err := conn.HandshakeContext(ctx); err != nil {
