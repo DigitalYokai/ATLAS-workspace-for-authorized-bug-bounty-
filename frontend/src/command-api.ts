@@ -19,5 +19,6 @@ export const commandApi={
  setSchedule:(target:string,id:string,enabled:boolean)=>request(`/targets/${target}/schedules/${id}`,{method:"PATCH",body:JSON.stringify({enabled})},z.object({enabled:z.boolean()})),
  settings:()=>request("/settings",{},z.record(z.string(),z.unknown())),
  updateSettings:(input:unknown)=>request("/settings",{method:"PATCH",body:JSON.stringify(input)},z.record(z.string(),z.unknown())),
+	backupURL:()=>`${base}/settings/backup`,
  exportURL:(target:string,format:"json"|"csv"|"markdown"|"graph")=>`${base}/targets/${target}/exports/${format}`,
 };

@@ -48,8 +48,22 @@ func (s *Service) loop() {
 			return
 		case <-tick.C:
 			_ = s.RunDue(context.Background())
+			_ = s.PurgeExpiredEvidence(context.Background())
 		}
 	}
+}
+
+// PurgeExpiredEvidence removes only retained raw evidence. The evidence row
+// remains as a provenance tombstone because SQLite composite foreign keys would
+// otherwise null the observation target ID along with its evidence ID.
+func (s *Service) PurgeExpiredEvidence(ctx context.Context) error {
+	var days int
+	if err := s.db.QueryRowContext(ctx, "SELECT CAST(value_json AS INTEGER) FROM app_settings WHERE key='evidence_retention_days'").Scan(&days); err != nil || days <= 0 {
+		return err
+	}
+	cutoff := time.Now().UTC().AddDate(0, 0, -days).Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, "UPDATE evidence SET content=NULL,storage_reference='retention_purged' WHERE collected_at<? AND content IS NOT NULL", cutoff)
+	return err
 }
 func (s *Service) Create(ctx context.Context, targetID string, in CreateInput) (Schedule, error) {
 	if len(in.Collectors) == 0 || in.IntervalHours < 1 {
