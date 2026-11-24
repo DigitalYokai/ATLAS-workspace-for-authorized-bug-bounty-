@@ -31,8 +31,32 @@ func NewService(db *sql.DB, collectors []Collector) *Service {
 		}
 		return m
 	}(), globalSem: make(chan struct{}, 4), cancels: map[string]context.CancelFunc{}}
-	_ = svc.repo.RecoverInterrupted(context.Background())
+	if err := svc.repo.RecoverInterrupted(context.Background()); err == nil {
+		go svc.resumePending()
+	}
 	return svc
+}
+
+// resumePending restores work that was interrupted by a process shutdown. Runs
+// are claimed before execution, making this safe if more than one ATLAS process
+// happens to start against the same database.
+func (s *Service) resumePending() {
+	ctx := context.Background()
+	runs, err := s.repo.Pending(ctx)
+	if err != nil {
+		return
+	}
+	for _, run := range runs {
+		t, err := s.targets.Get(ctx, run.TargetID)
+		if err != nil {
+			continue
+		}
+		rules, err := s.scopes.List(ctx, run.TargetID)
+		if err != nil {
+			continue
+		}
+		go s.execute(run, t.PrimaryDomain, rules)
+	}
 }
 func (s *Service) Start(ctx context.Context, targetID string, in CreateInput) (Run, error) {
 	if in.Mode == "" {
@@ -92,13 +116,21 @@ func (s *Service) Start(ctx context.Context, targetID string, in CreateInput) (R
 }
 func (s *Service) execute(run Run, domain string, rules []scope.Rule) {
 	ctx, cancel := context.WithCancel(context.Background())
+	claimed, err := s.repo.ClaimRun(ctx, run.ID)
+	if err != nil || !claimed {
+		cancel()
+		return
+	}
 	s.mu.Lock()
 	s.cancels[run.ID] = cancel
 	s.mu.Unlock()
 	defer func() { s.mu.Lock(); delete(s.cancels, run.ID); s.mu.Unlock() }()
-	_ = s.repo.SetRun(ctx, run.ID, Running, 0, 0, "")
 	_ = s.repo.AddEvent(ctx, run.TargetID, run.ID, "run_started", "Collection run started")
-	jobs, _ := s.repo.Jobs(ctx, run.ID)
+	jobs, err := s.repo.Jobs(ctx, run.ID)
+	if err != nil {
+		_ = s.repo.SetRun(context.Background(), run.ID, Failed, 0, 1, "load collection jobs: "+err.Error())
+		return
+	}
 	sem := make(chan struct{}, run.Configuration.Concurrency)
 	var rateTicker *time.Ticker
 	var rateGate <-chan time.Time
@@ -110,8 +142,10 @@ func (s *Service) execute(run Run, domain string, rules []scope.Rule) {
 	}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	done, failed := 0, 0
 	for _, job := range jobs {
+		if job.Status != Pending {
+			continue
+		}
 		job := job
 		wg.Add(1)
 		go func() {
@@ -141,17 +175,28 @@ func (s *Service) execute(run Run, domain string, rules []scope.Rule) {
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
-				failed++
 				_ = s.repo.SetJob(ctx, job.ID, Failed, err.Error())
 				_ = s.repo.AddEvent(ctx, run.TargetID, run.ID, "job_failed", job.CollectorName+": "+err.Error())
 			} else {
-				done++
 				_ = s.repo.SetJob(ctx, job.ID, Completed, "")
 				_ = s.repo.AddEvent(ctx, run.TargetID, run.ID, "job_completed", job.CollectorName)
 			}
 		}()
 	}
 	wg.Wait()
+	jobs, err = s.repo.Jobs(context.Background(), run.ID)
+	if err != nil {
+		return
+	}
+	done, failed := 0, 0
+	for _, job := range jobs {
+		switch job.Status {
+		case Completed:
+			done++
+		case Failed:
+			failed++
+		}
+	}
 	status := Completed
 	if ctx.Err() != nil {
 		status = Cancelled

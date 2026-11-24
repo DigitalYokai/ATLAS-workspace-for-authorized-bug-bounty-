@@ -7,9 +7,12 @@ import (
 	"github.com/atlas/atlas/backend/internal/platform/database"
 	"github.com/google/uuid"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/atlas/atlas/backend/internal/scope"
 )
 
 type blockingCollector struct{ current, max *int32 }
@@ -30,6 +33,36 @@ func (c blockingCollector) Collect(ctx context.Context, _ Request, emit func(Obs
 		return ctx.Err()
 	case <-time.After(40 * time.Millisecond):
 		return emit(Observation{EntityType: "technology", Value: "fixture", Source: "blocking", Confidence: 1, Metadata: "{}", ObservedAt: time.Now().UTC()})
+	}
+}
+
+type namedBlockingCollector struct {
+	name         string
+	active       bool
+	current, max *int32
+	started      chan<- time.Time
+}
+
+func (c namedBlockingCollector) Name() string        { return c.name }
+func (c namedBlockingCollector) Active() bool        { return c.active }
+func (c namedBlockingCollector) ScopeMethod() string { return "http_probe" }
+func (c namedBlockingCollector) Collect(ctx context.Context, _ Request, _ func(Observation) error) error {
+	n := atomic.AddInt32(c.current, 1)
+	for {
+		m := atomic.LoadInt32(c.max)
+		if n <= m || atomic.CompareAndSwapInt32(c.max, m, n) {
+			break
+		}
+	}
+	defer atomic.AddInt32(c.current, -1)
+	if c.started != nil {
+		c.started <- time.Now()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(25 * time.Millisecond):
+		return nil
 	}
 }
 
@@ -154,5 +187,101 @@ func TestPartialFailurePreservesSuccessfulObservation(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("successful observation lost: %d", count)
+	}
+}
+
+func TestInterruptedRunResumesWhenServiceStarts(t *testing.T) {
+	db := setupCollectionDB(t)
+	var current, max int32
+	first := NewService(db, []Collector{blockingCollector{&current, &max}})
+	run, err := first.repo.Create(context.Background(), "target", CreateInput{Collectors: []string{"blocking"}, Mode: Passive, Configuration: Configuration{Concurrency: 1, TimeoutSeconds: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.repo.SetRun(context.Background(), run.ID, Running, 0, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := first.repo.Jobs(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.repo.SetJob(context.Background(), jobs[0].ID, Running, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = NewService(db, []Collector{blockingCollector{&current, &max}})
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		got, err := first.repo.Get(context.Background(), run.ID)
+		if err == nil && got.Status == Completed {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	got, _ := first.repo.Get(context.Background(), run.ID)
+	t.Fatalf("recovered run status=%s", got.Status)
+}
+
+func TestWorkerConcurrencyIsBoundedAcrossCollectorJobs(t *testing.T) {
+	db := setupCollectionDB(t)
+	var current, max int32
+	collectors := []Collector{
+		namedBlockingCollector{name: "one", current: &current, max: &max},
+		namedBlockingCollector{name: "two", current: &current, max: &max},
+		namedBlockingCollector{name: "three", current: &current, max: &max},
+		namedBlockingCollector{name: "four", current: &current, max: &max},
+	}
+	s := NewService(db, collectors)
+	run, err := s.Start(context.Background(), "target", CreateInput{Collectors: []string{"one", "two", "three", "four"}, Mode: Passive, Configuration: Configuration{Concurrency: 2, TimeoutSeconds: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		got, _ := s.Get(context.Background(), run.ID)
+		if got.Status == Completed {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got, _ := s.Get(context.Background(), run.ID); got.Status != Completed {
+		t.Fatalf("run status=%s", got.Status)
+	}
+	if max != 2 {
+		t.Fatalf("maximum concurrent jobs=%d, want 2", max)
+	}
+}
+
+func TestActiveJobsObserveConfiguredRateLimit(t *testing.T) {
+	db := setupCollectionDB(t)
+	if err := scope.NewRepository(db).Replace(context.Background(), "target", []scope.Input{{Kind: "include", Pattern: "example.com", PermittedMethods: []string{"http_probe"}}}); err != nil {
+		t.Fatal(err)
+	}
+	var current, max int32
+	starts := make(chan time.Time, 2)
+	collectors := []Collector{
+		namedBlockingCollector{name: "active-one", active: true, current: &current, max: &max, started: starts},
+		namedBlockingCollector{name: "active-two", active: true, current: &current, max: &max, started: starts},
+	}
+	s := NewService(db, collectors)
+	_, err := s.Start(context.Background(), "target", CreateInput{Collectors: []string{"active-one", "active-two"}, Mode: Active, Configuration: Configuration{Concurrency: 2, TimeoutSeconds: 2, RateLimitPerMinute: 6000}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var observed []time.Time
+	var mu sync.Mutex
+	deadline := time.After(time.Second)
+	for len(observed) < 2 {
+		select {
+		case started := <-starts:
+			mu.Lock()
+			observed = append(observed, started)
+			mu.Unlock()
+		case <-deadline:
+			t.Fatal("timed out waiting for active collectors")
+		}
+	}
+	if elapsed := observed[1].Sub(observed[0]); elapsed < 8*time.Millisecond {
+		t.Fatalf("active requests were not rate limited: elapsed=%s", elapsed)
 	}
 }

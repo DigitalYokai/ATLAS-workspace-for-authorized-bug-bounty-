@@ -64,6 +64,19 @@ func (r *Repository) SetRun(ctx context.Context, id string, status Status, compl
 	_, e := r.db.ExecContext(ctx, "UPDATE collection_runs SET status=?,completed_jobs=?,failed_jobs=?,error_summary=?,updated_at=?,started_at=CASE WHEN ?='running' AND started_at IS NULL THEN ? ELSE started_at END,completed_at=CASE WHEN ? IN ('completed','partially_completed','failed','cancelled') THEN ? ELSE completed_at END WHERE id=?", status, completed, failed, message, now, status, now, status, now, id)
 	return e
 }
+
+// ClaimRun transitions a queued run to running exactly once. It is the durable
+// hand-off between the scheduler and an executor, so a second process cannot
+// execute the same pending run concurrently.
+func (r *Repository) ClaimRun(ctx context.Context, id string) (bool, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	result, err := r.db.ExecContext(ctx, "UPDATE collection_runs SET status='running',started_at=COALESCE(started_at,?),updated_at=? WHERE id=? AND status='pending'", now, now, id)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	return changed == 1, err
+}
 func (r *Repository) SetJob(ctx context.Context, id string, status Status, message string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, e := r.db.ExecContext(ctx, "UPDATE collection_jobs SET status=?,error_summary=?,updated_at=?,started_at=CASE WHEN ?='running' AND started_at IS NULL THEN ? ELSE started_at END,completed_at=CASE WHEN ? IN ('completed','failed','cancelled') THEN ? ELSE completed_at END WHERE id=?", status, message, now, status, now, status, now, id)
@@ -111,6 +124,26 @@ func (r *Repository) List(ctx context.Context, targetID string) ([]Run, error) {
 			return nil, e
 		}
 		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+func (r *Repository) Pending(ctx context.Context) ([]Run, error) {
+	rows, e := r.db.QueryContext(ctx, "SELECT id FROM collection_runs WHERE status='pending' ORDER BY created_at")
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	out := []Run{}
+	for rows.Next() {
+		var id string
+		if e = rows.Scan(&id); e != nil {
+			return nil, e
+		}
+		run, e := r.Get(ctx, id)
+		if e != nil {
+			return nil, e
+		}
+		out = append(out, run)
 	}
 	return out, rows.Err()
 }

@@ -88,20 +88,32 @@ func (c HTTPMetadataCollector) Collect(ctx context.Context, r Request, emit func
 	}
 	client := c.Client
 	if client == nil {
-		client = &http.Client{Timeout: time.Duration(r.Configuration.TimeoutSeconds) * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			d := scope.Evaluate(r.Rules, req.URL.Hostname(), "http_probe")
-			if !d.ActiveApproved || network.PublicDestination(req.Context(), resolver, req.URL.Hostname()) != nil {
-				return fmt.Errorf("redirect scope denied")
-			}
-			return nil
-		}}
+		client = &http.Client{Timeout: time.Duration(r.Configuration.TimeoutSeconds) * time.Second}
+	}
+	// Copy the client so this collector never mutates a caller-owned client.
+	// Redirect scope and destination checks must apply equally to production and
+	// injected fixture clients.
+	clientCopy := *client
+	originalRedirect := client.CheckRedirect
+	clientCopy.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		d := scope.Evaluate(r.Rules, req.URL.Hostname(), "http_probe")
+		if !d.ActiveApproved {
+			return fmt.Errorf("redirect scope denied: %s", d.Reason)
+		}
+		if err := network.PublicDestination(req.Context(), resolver, req.URL.Hostname()); err != nil {
+			return fmt.Errorf("redirect destination denied: %w", err)
+		}
+		if originalRedirect != nil {
+			return originalRedirect(req, via)
+		}
+		return nil
 	}
 	u := url.URL{Scheme: "https", Host: r.PrimaryDomain}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return err
 	}
-	resp, err := client.Do(req)
+	resp, err := clientCopy.Do(req)
 	if err != nil {
 		return err
 	}

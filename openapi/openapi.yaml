@@ -20,6 +20,15 @@ paths:
   /api/v1/runs/{id}/events:
     get: {summary: Stream persisted collection progress over SSE, responses: {'200': {description: Event stream}}}
   /api/v1/targets/{id}/entities:
-    get: {summary: List target assets, responses: {'200': {description: OK}}}
+    get:
+      summary: List target assets
+      parameters:
+        - {name: type, in: query, schema: {type: string}, description: Optional entity type filter}
+        - {name: scopeStatus, in: query, schema: {type: string, enum: [included, excluded, unknown]}, description: Optional scope classification filter}
+      responses: {'200': {description: OK}}
+  /api/v1/targets/{id}/entities/{entityId}:
+    get: {summary: Inspect an asset including canonical value and metadata, responses: {'200': {description: OK}, '404': {description: Not found}}}
   /api/v1/targets/{id}/observations:
     get: {summary: List target observations, responses: {'200': {description: OK}}}
+  /api/v1/targets/{id}/evidence/{evidenceId}:
+    get: {summary: Retrieve retained, unexecuted evidence content and provenance, responses: {'200': {description: OK}, '404': {description: Not found}}}

@@ -36,6 +36,9 @@ func canonical(kind, value string) (string, error) {
 	return strings.ToLower(v), nil
 }
 func (i *Ingestor) Ingest(ctx context.Context, targetID, runID string, o Input) error {
+	if strings.TrimSpace(o.Source) == "" {
+		return fmt.Errorf("observation source is required")
+	}
 	value, err := canonical(o.EntityType, o.Value)
 	if err != nil {
 		return err

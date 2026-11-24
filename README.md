@@ -14,7 +14,7 @@ Open http://localhost:5173. SQLite data is retained in the `atlas-data` Docker v
 
 ```sh
 cd backend && go test ./...
-cd frontend && npm install && npm run build
+cd frontend && npm install && npm test && npm run build
 ```
 
 ## Architecture
@@ -22,3 +22,5 @@ cd frontend && npm install && npm run build
 The Go modular monolith separates target, scope, intelligence, investigation, platform, and HTTP transport concerns. SQLite migrations live in `backend/db/migrations`; queries are documented in `backend/db/queries` for sqlc generation. Scope decisions are centralized on the backend: exclusions override inclusions and label-safe wildcards never match a base domain.
 
 Collection runs are persisted and expose progress through `/api/v1/runs/{id}/events` (SSE). Passive collection is the default. Active HTTP and TLS collectors require an approved scope method and reject private, loopback, link-local, multicast, and unspecified resolved destinations.
+
+The collection queue is restart-safe: interrupted work is returned to the pending queue and claimed once when ATLAS starts again. Collection observations are idempotent within a run, retain collector/source/timestamp provenance, and feed the target asset inventory. The inventory supports entity type and scope filters, asset detail, and a safe evidence viewer.
