@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -10,18 +11,24 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/atlas/atlas/backend/internal/platform/database"
 )
 
 func newTestAPI(t *testing.T) http.Handler {
 	t.Helper()
+	h, _ := newTestAPIWithDB(t)
+	return h
+}
+func newTestAPIWithDB(t *testing.T) (http.Handler, *sql.DB) {
+	t.Helper()
 	db, err := database.Open(context.Background(), filepath.Join(t.TempDir(), "atlas.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	return New(db, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(db, slog.New(slog.NewTextHandler(io.Discard, nil))), db
 }
 func request(t *testing.T, h http.Handler, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -64,5 +71,36 @@ func TestScopeHTTPExclusionPrecedence(t *testing.T) {
 	result := request(t, h, http.MethodPost, "/api/v1/targets/"+target.ID+"/scope/validate", `{"host":"payments.example.com","method":"dns_lookup"}`)
 	if result.Code != http.StatusOK || !bytes.Contains(result.Body.Bytes(), []byte(`"status":"excluded"`)) {
 		t.Fatalf("scope result status=%d body=%s", result.Code, result.Body.String())
+	}
+}
+
+func TestObservationsSerializeMissingEvidenceAsNull(t *testing.T) {
+	h, db := newTestAPIWithDB(t)
+	created := request(t, h, http.MethodPost, "/api/v1/targets", `{"name":"Example","primaryDomain":"example.com"}`)
+	var target struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &target); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := db.Exec("INSERT INTO observations(id,target_id,collector,observation_type,subject,value,source,evidence_id,observed_at,confidence,raw_metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", "observation", target.ID, "fixture", "technology", "fixture", "fixture", "fixture", nil, now, 1, `{}`, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := request(t, h, http.MethodGet, "/api/v1/targets/"+target.ID+"/observations", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Data []struct {
+			EvidenceID *string `json:"evidenceId"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Data) != 1 || body.Data[0].EvidenceID != nil {
+		t.Fatalf("unexpected evidence response: %s", response.Body.String())
 	}
 }

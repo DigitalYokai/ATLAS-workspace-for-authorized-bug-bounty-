@@ -404,7 +404,11 @@ func (a *API) listObservations(w http.ResponseWriter, r *http.Request) {
 			fail(w, 500, "internal_error", "could not read observation")
 			return
 		}
-		out = append(out, map[string]any{"id": id, "collector": c, "observationType": t, "subject": subject, "value": value, "source": source, "evidenceId": evidence, "observedAt": observed, "confidence": confidence, "metadata": json.RawMessage(metadata)})
+		var evidenceID any
+		if evidence.Valid {
+			evidenceID = evidence.String
+		}
+		out = append(out, map[string]any{"id": id, "collector": c, "observationType": t, "subject": subject, "value": value, "source": source, "evidenceId": evidenceID, "observedAt": observed, "confidence": confidence, "metadata": json.RawMessage(metadata)})
 	}
 	write(w, 200, map[string]any{"data": out})
 }
