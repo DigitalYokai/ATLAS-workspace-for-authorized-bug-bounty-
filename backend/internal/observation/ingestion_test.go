@@ -60,3 +60,21 @@ func TestIngestRejectsMissingSource(t *testing.T) {
 		t.Fatal("expected missing provenance source to be rejected")
 	}
 }
+
+func TestIngestRejectsEvidenceAboveConfiguredLimit(t *testing.T) {
+	db := setupIngestionDB(t)
+	if _, err := db.Exec("UPDATE app_settings SET value_json='1024' WHERE key='evidence_max_bytes'"); err != nil {
+		t.Fatal(err)
+	}
+	err := NewIngestor(db, scope.NewRepository(db)).Ingest(context.Background(), "target", "run", Input{EntityType: "domain", Value: "example.com", Source: "fixture", Metadata: `{}`, Evidence: string(make([]byte, 1025))})
+	if err == nil {
+		t.Fatal("expected oversize evidence to be rejected")
+	}
+	var count int
+	if err := db.QueryRow("SELECT count(*) FROM observations").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("observations=%d, expected no partial ingestion", count)
+	}
+}

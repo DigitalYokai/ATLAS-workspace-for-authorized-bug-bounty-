@@ -252,6 +252,34 @@ func TestWorkerConcurrencyIsBoundedAcrossCollectorJobs(t *testing.T) {
 	}
 }
 
+func TestWorkerConcurrencyUsesConfiguredDefault(t *testing.T) {
+	db := setupCollectionDB(t)
+	if _, err := db.Exec("UPDATE app_settings SET value_json='1' WHERE key='default_concurrency'"); err != nil {
+		t.Fatal(err)
+	}
+	var current, max int32
+	collectors := []Collector{
+		namedBlockingCollector{name: "one", current: &current, max: &max},
+		namedBlockingCollector{name: "two", current: &current, max: &max},
+	}
+	s := NewService(db, collectors)
+	run, err := s.Start(context.Background(), "target", CreateInput{Collectors: []string{"one", "two"}, Mode: Passive, Configuration: Configuration{TimeoutSeconds: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		got, _ := s.Get(context.Background(), run.ID)
+		if got.Status == Completed {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if max != 1 {
+		t.Fatalf("maximum concurrent jobs=%d, want setting default 1", max)
+	}
+}
+
 func TestActiveJobsObserveConfiguredRateLimit(t *testing.T) {
 	db := setupCollectionDB(t)
 	if err := scope.NewRepository(db).Replace(context.Background(), "target", []scope.Input{{Kind: "include", Pattern: "example.com", PermittedMethods: []string{"http_probe"}}}); err != nil {

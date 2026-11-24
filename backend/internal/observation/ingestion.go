@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -87,6 +88,15 @@ func (i *Ingestor) Ingest(ctx context.Context, targetID, runID string, o Input) 
 	if o.ObservedAt.IsZero() {
 		o.ObservedAt = now
 	}
+	if o.Evidence != "" {
+		maximum, err := i.maximumEvidenceBytes(ctx)
+		if err != nil {
+			return err
+		}
+		if len([]byte(o.Evidence)) > maximum {
+			return fmt.Errorf("evidence is %d bytes, exceeding configured maximum of %d bytes", len([]byte(o.Evidence)), maximum)
+		}
+	}
 	tx, err := i.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -128,4 +138,20 @@ func (i *Ingestor) Ingest(ctx context.Context, targetID, runID string, o Input) 
 		return err
 	}
 	return tx.Commit()
+}
+
+func (i *Ingestor) maximumEvidenceBytes(ctx context.Context) (int, error) {
+	var raw string
+	err := i.db.QueryRowContext(ctx, "SELECT value_json FROM app_settings WHERE key='evidence_max_bytes'").Scan(&raw)
+	if err == sql.ErrNoRows {
+		return 1024 * 1024, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("load evidence size limit: %w", err)
+	}
+	maximum, err := strconv.Atoi(raw)
+	if err != nil || maximum < 1024 {
+		return 0, fmt.Errorf("configured evidence size limit is invalid")
+	}
+	return maximum, nil
 }

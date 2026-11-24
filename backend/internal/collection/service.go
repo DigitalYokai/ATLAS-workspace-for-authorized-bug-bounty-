@@ -7,6 +7,7 @@ import (
 	"github.com/atlas/atlas/backend/internal/observation"
 	"github.com/atlas/atlas/backend/internal/scope"
 	"github.com/atlas/atlas/backend/internal/target"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -78,7 +79,7 @@ func (s *Service) Start(ctx context.Context, targetID string, in CreateInput) (R
 		return Run{}, fmt.Errorf("select at least one collector")
 	}
 	if in.Configuration.Concurrency < 1 || in.Configuration.Concurrency > 4 {
-		in.Configuration.Concurrency = 2
+		in.Configuration.Concurrency = s.defaultConcurrency(ctx)
 	}
 	if in.Configuration.TimeoutSeconds < 1 || in.Configuration.TimeoutSeconds > 60 {
 		in.Configuration.TimeoutSeconds = 15
@@ -122,6 +123,21 @@ func (s *Service) Start(ctx context.Context, targetID string, in CreateInput) (R
 	}
 	go s.execute(run, t.PrimaryDomain, rules)
 	return run, nil
+}
+
+// defaultConcurrency reads the operator-selected safe default. A malformed or
+// unavailable setting must never make a collection unsafe, so it falls back to
+// the documented default of two workers.
+func (s *Service) defaultConcurrency(ctx context.Context) int {
+	var raw string
+	if err := s.repo.db.QueryRowContext(ctx, "SELECT value_json FROM app_settings WHERE key='default_concurrency'").Scan(&raw); err != nil {
+		return 2
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 || value > 4 {
+		return 2
+	}
+	return value
 }
 func (s *Service) execute(run Run, domain string, rules []scope.Rule) {
 	ctx, cancel := context.WithCancel(context.Background())
