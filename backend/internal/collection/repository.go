@@ -114,3 +114,28 @@ func (r *Repository) List(ctx context.Context, targetID string) ([]Run, error) {
 	}
 	return out, rows.Err()
 }
+func (r *Repository) Events(ctx context.Context, runID string, after string) ([]Event, error) {
+	q := "SELECT id,event_type,message,created_at FROM collection_events WHERE run_id=?"
+	args := []any{runID}
+	if after != "" {
+		q += " AND created_at>?"
+		args = append(args, after)
+	}
+	q += " ORDER BY created_at"
+	rows, e := r.db.QueryContext(ctx, q, args...)
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	out := []Event{}
+	for rows.Next() {
+		var x Event
+		var created string
+		if e = rows.Scan(&x.ID, &x.EventType, &x.Message, &created); e != nil {
+			return nil, e
+		}
+		x.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}

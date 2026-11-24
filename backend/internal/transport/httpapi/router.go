@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/atlas/atlas/backend/internal/collection"
 	"github.com/atlas/atlas/backend/internal/investigation"
 	"github.com/atlas/atlas/backend/internal/scope"
@@ -12,9 +13,11 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type API struct {
+	db      *sql.DB
 	targets *target.Service
 	scopes  *scope.Repository
 	notes   *investigation.Repository
@@ -25,7 +28,7 @@ type API struct {
 func New(db *sql.DB, log *slog.Logger) http.Handler {
 	sc := scope.NewRepository(db)
 	tr := target.NewRepository(db)
-	api := &API{targets: target.NewService(db, tr, sc), scopes: sc, notes: investigation.NewRepository(db), runs: collection.NewService(db, []collection.Collector{collection.DNSCollector{}, collection.HTTPMetadataCollector{}}), log: log}
+	api := &API{db: db, targets: target.NewService(db, tr, sc), scopes: sc, notes: investigation.NewRepository(db), runs: collection.NewService(db, []collection.Collector{collection.DNSCollector{}, collection.HTTPMetadataCollector{}, collection.TLSCollector{}, collection.CTCollector{}}), log: log}
 	return api.routes()
 }
 func (a *API) routes() http.Handler {
@@ -45,6 +48,9 @@ func (a *API) routes() http.Handler {
 	m.HandleFunc("POST /api/v1/targets/{id}/runs", a.createRun)
 	m.HandleFunc("GET /api/v1/runs/{id}", a.getRun)
 	m.HandleFunc("POST /api/v1/runs/{id}/cancel", a.cancelRun)
+	m.HandleFunc("GET /api/v1/runs/{id}/events", a.runEvents)
+	m.HandleFunc("GET /api/v1/targets/{id}/entities", a.listEntities)
+	m.HandleFunc("GET /api/v1/targets/{id}/entities/{entityId}", a.getEntity)
 	return middleware(m, a.log)
 }
 func middleware(next http.Handler, log *slog.Logger) http.Handler {
@@ -288,4 +294,92 @@ func (a *API) cancelRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, 202, map[string]string{"status": "cancelling"})
+}
+func (a *API) runEvents(w http.ResponseWriter, r *http.Request) {
+	run, e := a.runs.Get(r.Context(), r.PathValue("id"))
+	if errors.Is(e, sql.ErrNoRows) {
+		fail(w, 404, "not_found", "collection run not found")
+		return
+	}
+	if e != nil {
+		fail(w, 500, "internal_error", "could not load run")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		fail(w, 500, "stream_unsupported", "streaming unavailable")
+		return
+	}
+	after := ""
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		events, e := a.runs.Events(r.Context(), run.ID, after)
+		if e != nil {
+			return
+		}
+		for _, event := range events {
+			after = event.CreatedAt.Format(time.RFC3339Nano)
+			b, _ := json.Marshal(event)
+			_, _ = fmt.Fprintf(w, "event: progress\ndata: %s\n\n", b)
+			flusher.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+func (a *API) listEntities(w http.ResponseWriter, r *http.Request) {
+	if !a.ensureTarget(w, r) {
+		return
+	}
+	typ := r.URL.Query().Get("type")
+	status := r.URL.Query().Get("scopeStatus")
+	q := "SELECT id,type,canonical_value,display_value,scope_status,first_seen_at,last_seen_at FROM entities WHERE target_id=?"
+	args := []any{r.PathValue("id")}
+	if typ != "" {
+		q += " AND type=?"
+		args = append(args, typ)
+	}
+	if status != "" {
+		q += " AND scope_status=?"
+		args = append(args, status)
+	}
+	q += " ORDER BY last_seen_at DESC LIMIT 100"
+	rows, e := a.db.QueryContext(r.Context(), q, args...)
+	if e != nil {
+		fail(w, 500, "internal_error", "could not list entities")
+		return
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var id, t, c, d, s, first, last string
+		if e = rows.Scan(&id, &t, &c, &d, &s, &first, &last); e != nil {
+			fail(w, 500, "internal_error", "could not read entity")
+			return
+		}
+		out = append(out, map[string]any{"id": id, "type": t, "canonicalValue": c, "displayValue": d, "scopeStatus": s, "firstSeenAt": first, "lastSeenAt": last})
+	}
+	write(w, 200, map[string]any{"data": out})
+}
+func (a *API) getEntity(w http.ResponseWriter, r *http.Request) {
+	if !a.ensureTarget(w, r) {
+		return
+	}
+	var id, t, c, d, s, metadata, first, last string
+	e := a.db.QueryRowContext(r.Context(), "SELECT id,type,canonical_value,display_value,scope_status,metadata_json,first_seen_at,last_seen_at FROM entities WHERE target_id=? AND id=?", r.PathValue("id"), r.PathValue("entityId")).Scan(&id, &t, &c, &d, &s, &metadata, &first, &last)
+	if errors.Is(e, sql.ErrNoRows) {
+		fail(w, 404, "not_found", "entity not found")
+		return
+	}
+	if e != nil {
+		fail(w, 500, "internal_error", "could not load entity")
+		return
+	}
+	write(w, 200, map[string]any{"id": id, "type": t, "canonicalValue": c, "displayValue": d, "scopeStatus": s, "metadata": json.RawMessage(metadata), "firstSeenAt": first, "lastSeenAt": last})
 }

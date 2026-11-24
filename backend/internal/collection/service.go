@@ -145,3 +145,6 @@ func (s *Service) Get(ctx context.Context, id string) (Run, error) { return s.re
 func (s *Service) List(ctx context.Context, targetID string) ([]Run, error) {
 	return s.repo.List(ctx, targetID)
 }
+func (s *Service) Events(ctx context.Context, id, after string) ([]Event, error) {
+	return s.repo.Events(ctx, id, after)
+}
