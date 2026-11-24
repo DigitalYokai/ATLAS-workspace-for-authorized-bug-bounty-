@@ -1,0 +1,16 @@
+services:
+  api:
+    build: ./backend
+    environment:
+      ATLAS_ADDR: 0.0.0.0:8080
+      ATLAS_DATABASE_URL: /data/atlas.db
+    ports: ["127.0.0.1:8080:8080"]
+    volumes: ["atlas-data:/data"]
+  web:
+    build: ./frontend
+    environment:
+      VITE_API_URL: http://localhost:8080/api/v1
+    ports: ["127.0.0.1:5173:5173"]
+    depends_on: [api]
+volumes:
+  atlas-data:

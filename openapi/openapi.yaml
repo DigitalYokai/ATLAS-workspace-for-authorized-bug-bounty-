@@ -1,0 +1,12 @@
+openapi: 3.1.0
+info: {title: ATLAS API, version: 0.1.0}
+paths:
+  /api/v1/targets:
+    get: {summary: List active targets, responses: {'200': {description: OK}}}
+    post: {summary: Create target and initial scope, responses: {'201': {description: Created}, '400': {description: Validation error}}}
+  /api/v1/targets/{id}:
+    get: {summary: Get target profile, responses: {'200': {description: OK}, '404': {description: Not found}}}
+    patch: {summary: Update or archive target, responses: {'200': {description: OK}}}
+  /api/v1/targets/{id}/scope:
+    get: {summary: List scope rules, responses: {'200': {description: OK}}}
+    put: {summary: Replace scope rules, responses: {'200': {description: OK}}}
