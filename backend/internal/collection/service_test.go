@@ -285,3 +285,20 @@ func TestActiveJobsObserveConfiguredRateLimit(t *testing.T) {
 		t.Fatalf("active requests were not rate limited: elapsed=%s", elapsed)
 	}
 }
+
+func TestListRunsDoesNotBlockSingleSQLiteConnection(t *testing.T) {
+	db := setupCollectionDB(t)
+	repo := NewRepository(db)
+	if _, err := repo.Create(context.Background(), "target", CreateInput{Collectors: []string{"fixture"}, Mode: Passive, Configuration: Configuration{Concurrency: 1, TimeoutSeconds: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	runs, err := repo.List(ctx, "target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("runs=%d, want 1", len(runs))
+	}
+}

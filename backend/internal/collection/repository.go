@@ -113,19 +113,29 @@ func (r *Repository) List(ctx context.Context, targetID string) ([]Run, error) {
 		return nil, e
 	}
 	defer rows.Close()
-	out := []Run{}
+	ids := []string{}
 	for rows.Next() {
 		var id string
 		if e = rows.Scan(&id); e != nil {
 			return nil, e
 		}
+		ids = append(ids, id)
+	}
+	if e = rows.Err(); e != nil {
+		return nil, e
+	}
+	if e = rows.Close(); e != nil {
+		return nil, e
+	}
+	out := make([]Run, 0, len(ids))
+	for _, id := range ids {
 		x, e := r.Get(ctx, id)
 		if e != nil {
 			return nil, e
 		}
 		out = append(out, x)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 func (r *Repository) Pending(ctx context.Context) ([]Run, error) {
 	rows, e := r.db.QueryContext(ctx, "SELECT id FROM collection_runs WHERE status='pending' ORDER BY created_at")
@@ -133,19 +143,29 @@ func (r *Repository) Pending(ctx context.Context) ([]Run, error) {
 		return nil, e
 	}
 	defer rows.Close()
-	out := []Run{}
+	ids := []string{}
 	for rows.Next() {
 		var id string
 		if e = rows.Scan(&id); e != nil {
 			return nil, e
 		}
+		ids = append(ids, id)
+	}
+	if e = rows.Err(); e != nil {
+		return nil, e
+	}
+	if e = rows.Close(); e != nil {
+		return nil, e
+	}
+	out := make([]Run, 0, len(ids))
+	for _, id := range ids {
 		run, e := r.Get(ctx, id)
 		if e != nil {
 			return nil, e
 		}
 		out = append(out, run)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 func (r *Repository) Events(ctx context.Context, runID string, after string) ([]Event, error) {
 	q := "SELECT id,event_type,message,created_at FROM collection_events WHERE run_id=?"
