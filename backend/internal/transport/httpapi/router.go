@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"github.com/atlas/atlas/backend/internal/collection"
 	"github.com/atlas/atlas/backend/internal/investigation"
 	"github.com/atlas/atlas/backend/internal/scope"
 	"github.com/atlas/atlas/backend/internal/target"
@@ -17,13 +18,14 @@ type API struct {
 	targets *target.Service
 	scopes  *scope.Repository
 	notes   *investigation.Repository
+	runs    *collection.Service
 	log     *slog.Logger
 }
 
 func New(db *sql.DB, log *slog.Logger) http.Handler {
 	sc := scope.NewRepository(db)
 	tr := target.NewRepository(db)
-	api := &API{target.NewService(db, tr, sc), sc, investigation.NewRepository(db), log}
+	api := &API{targets: target.NewService(db, tr, sc), scopes: sc, notes: investigation.NewRepository(db), runs: collection.NewService(db, []collection.Collector{collection.DNSCollector{}, collection.HTTPMetadataCollector{}}), log: log}
 	return api.routes()
 }
 func (a *API) routes() http.Handler {
@@ -39,6 +41,10 @@ func (a *API) routes() http.Handler {
 	m.HandleFunc("POST /api/v1/targets/{id}/scope/validate", a.validateScope)
 	m.HandleFunc("GET /api/v1/targets/{id}/notes", a.listNotes)
 	m.HandleFunc("POST /api/v1/targets/{id}/notes", a.createNote)
+	m.HandleFunc("GET /api/v1/targets/{id}/runs", a.listRuns)
+	m.HandleFunc("POST /api/v1/targets/{id}/runs", a.createRun)
+	m.HandleFunc("GET /api/v1/runs/{id}", a.getRun)
+	m.HandleFunc("POST /api/v1/runs/{id}/cancel", a.cancelRun)
 	return middleware(m, a.log)
 }
 func middleware(next http.Handler, log *slog.Logger) http.Handler {
@@ -235,4 +241,51 @@ func (a *API) createNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, 201, n)
+}
+
+func (a *API) listRuns(w http.ResponseWriter, r *http.Request) {
+	if !a.ensureTarget(w, r) {
+		return
+	}
+	runs, e := a.runs.List(r.Context(), r.PathValue("id"))
+	if e != nil {
+		fail(w, 500, "internal_error", "could not list runs")
+		return
+	}
+	write(w, 200, map[string]any{"data": runs})
+}
+func (a *API) createRun(w http.ResponseWriter, r *http.Request) {
+	if !a.ensureTarget(w, r) {
+		return
+	}
+	var in collection.CreateInput
+	if e := decode(r, &in); e != nil {
+		fail(w, 400, "validation_failed", "invalid request body")
+		return
+	}
+	run, e := a.runs.Start(r.Context(), r.PathValue("id"), in)
+	if e != nil {
+		fail(w, 400, "validation_failed", e.Error())
+		return
+	}
+	write(w, 202, run)
+}
+func (a *API) getRun(w http.ResponseWriter, r *http.Request) {
+	run, e := a.runs.Get(r.Context(), r.PathValue("id"))
+	if errors.Is(e, sql.ErrNoRows) {
+		fail(w, 404, "not_found", "collection run not found")
+		return
+	}
+	if e != nil {
+		fail(w, 500, "internal_error", "could not load collection run")
+		return
+	}
+	write(w, 200, run)
+}
+func (a *API) cancelRun(w http.ResponseWriter, r *http.Request) {
+	if !a.runs.Cancel(r.PathValue("id")) {
+		fail(w, 409, "not_running", "collection run is not running")
+		return
+	}
+	write(w, 202, map[string]string{"status": "cancelling"})
 }

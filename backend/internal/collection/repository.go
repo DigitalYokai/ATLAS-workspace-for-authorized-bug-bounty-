@@ -58,3 +58,59 @@ func (r *Repository) Jobs(ctx context.Context, runID string) ([]Job, error) {
 	}
 	return out, rows.Err()
 }
+
+func (r *Repository) SetRun(ctx context.Context, id string, status Status, completed, failed int, message string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, e := r.db.ExecContext(ctx, "UPDATE collection_runs SET status=?,completed_jobs=?,failed_jobs=?,error_summary=?,updated_at=?,started_at=CASE WHEN ?='running' AND started_at IS NULL THEN ? ELSE started_at END,completed_at=CASE WHEN ? IN ('completed','partially_completed','failed','cancelled') THEN ? ELSE completed_at END WHERE id=?", status, completed, failed, message, now, status, now, status, now, id)
+	return e
+}
+func (r *Repository) SetJob(ctx context.Context, id string, status Status, message string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, e := r.db.ExecContext(ctx, "UPDATE collection_jobs SET status=?,error_summary=?,updated_at=?,started_at=CASE WHEN ?='running' AND started_at IS NULL THEN ? ELSE started_at END,completed_at=CASE WHEN ? IN ('completed','failed','cancelled') THEN ? ELSE completed_at END WHERE id=?", status, message, now, status, now, status, now, id)
+	return e
+}
+func (r *Repository) AddEvent(ctx context.Context, targetID, runID, kind, message string) error {
+	_, e := r.db.ExecContext(ctx, "INSERT INTO collection_events(id,target_id,run_id,event_type,message,created_at) VALUES(?,?,?,?,?,?)", uuid.NewString(), targetID, runID, kind, message, time.Now().UTC().Format(time.RFC3339Nano))
+	return e
+}
+func (r *Repository) Get(ctx context.Context, id string) (Run, error) {
+	var x Run
+	var cfg, created, updated string
+	var started, completed sql.NullString
+	err := r.db.QueryRowContext(ctx, "SELECT id,target_id,mode,status,configuration_json,error_summary,total_jobs,completed_jobs,failed_jobs,started_at,completed_at,created_at,updated_at FROM collection_runs WHERE id=?", id).Scan(&x.ID, &x.TargetID, &x.Mode, &x.Status, &cfg, &x.ErrorSummary, &x.TotalJobs, &x.CompletedJobs, &x.FailedJobs, &started, &completed, &created, &updated)
+	if err != nil {
+		return x, err
+	}
+	_ = json.Unmarshal([]byte(cfg), &x.Configuration)
+	x.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	x.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+	if started.Valid {
+		v, _ := time.Parse(time.RFC3339Nano, started.String)
+		x.StartedAt = &v
+	}
+	if completed.Valid {
+		v, _ := time.Parse(time.RFC3339Nano, completed.String)
+		x.CompletedAt = &v
+	}
+	return x, nil
+}
+func (r *Repository) List(ctx context.Context, targetID string) ([]Run, error) {
+	rows, e := r.db.QueryContext(ctx, "SELECT id FROM collection_runs WHERE target_id=? ORDER BY created_at DESC", targetID)
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	out := []Run{}
+	for rows.Next() {
+		var id string
+		if e = rows.Scan(&id); e != nil {
+			return nil, e
+		}
+		x, e := r.Get(ctx, id)
+		if e != nil {
+			return nil, e
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
