@@ -19,9 +19,9 @@ type Ingestor struct {
 	scopes *scope.Repository
 }
 type Input struct {
-	EntityType, Value, Source, Metadata, Evidence string
-	Confidence                                    float64
-	ObservedAt                                    time.Time
+	EntityType, ObservationType, Subject, Value, Source, Metadata, Evidence, Origin string
+	Confidence                                                                      float64
+	ObservedAt                                                                      time.Time
 }
 
 func NewIngestor(db *sql.DB, scopes *scope.Repository) *Ingestor { return &Ingestor{db, scopes} }
@@ -38,6 +38,12 @@ func canonical(kind, value string) (string, error) {
 func (i *Ingestor) Ingest(ctx context.Context, targetID, runID string, o Input) error {
 	if strings.TrimSpace(o.Source) == "" {
 		return fmt.Errorf("observation source is required")
+	}
+	if o.Origin == "" {
+		o.Origin = "automated"
+	}
+	if o.Origin != "automated" && o.Origin != "manual" {
+		return fmt.Errorf("invalid observation origin")
 	}
 	value, err := canonical(o.EntityType, o.Value)
 	if err != nil {
@@ -84,8 +90,18 @@ func (i *Ingestor) Ingest(ctx context.Context, targetID, runID string, o Input) 
 		}
 		evidenceID = found
 	}
-	key := fmt.Sprintf("%s|%s|%s|%s", runID, o.Source, o.EntityType, value)
-	_, err = tx.ExecContext(ctx, "INSERT INTO observations(id,target_id,collection_run_id,collector,observation_type,subject,value,source,evidence_id,observed_at,confidence,raw_metadata_json,idempotency_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(target_id,idempotency_key) DO NOTHING", uuid.NewString(), targetID, runID, o.Source, o.EntityType, value, o.Value, o.Source, evidenceID, o.ObservedAt.Format(time.RFC3339Nano), o.Confidence, o.Metadata, key, now.Format(time.RFC3339Nano))
+	if o.ObservationType == "" {
+		o.ObservationType = o.EntityType
+	}
+	if strings.TrimSpace(o.Subject) == "" {
+		o.Subject = value
+	}
+	key := fmt.Sprintf("%s|%s|%s|%s|%s", runID, o.Source, o.ObservationType, o.Subject, value)
+	var collectionRunID any
+	if runID != "" {
+		collectionRunID = runID
+	}
+	_, err = tx.ExecContext(ctx, "INSERT INTO observations(id,target_id,collection_run_id,collector,observation_type,subject,value,source,evidence_id,observed_at,confidence,raw_metadata_json,idempotency_key,created_at,origin) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(target_id,idempotency_key) DO NOTHING", uuid.NewString(), targetID, collectionRunID, o.Source, o.ObservationType, o.Subject, o.Value, o.Source, evidenceID, o.ObservedAt.Format(time.RFC3339Nano), o.Confidence, o.Metadata, key, now.Format(time.RFC3339Nano), o.Origin)
 	if err != nil {
 		return err
 	}

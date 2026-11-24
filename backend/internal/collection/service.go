@@ -20,6 +20,15 @@ type Service struct {
 	globalSem  chan struct{}
 	mu         sync.Mutex
 	cancels    map[string]context.CancelFunc
+	onComplete func(context.Context, Run) error
+}
+
+// SetCompletionProcessor wires optional post-collection processing without
+// making collection depend on a concrete correlation implementation.
+func (s *Service) SetCompletionProcessor(processor func(context.Context, Run) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onComplete = processor
 }
 
 func NewService(db *sql.DB, collectors []Collector) *Service {
@@ -169,7 +178,7 @@ func (s *Service) execute(run Run, domain string, rules []scope.Rule) {
 			}
 			cctx, stop := context.WithTimeout(ctx, time.Duration(run.Configuration.TimeoutSeconds)*time.Second)
 			err := c.Collect(cctx, Request{TargetID: run.TargetID, PrimaryDomain: domain, Mode: run.Mode, Rules: rules, Configuration: run.Configuration}, func(o Observation) error {
-				return s.ingest.Ingest(cctx, run.TargetID, run.ID, observation.Input{EntityType: o.EntityType, Value: o.Value, Source: o.Source, Confidence: o.Confidence, Metadata: o.Metadata, Evidence: o.Evidence, ObservedAt: o.ObservedAt})
+				return s.ingest.Ingest(cctx, run.TargetID, run.ID, observation.Input{EntityType: o.EntityType, ObservationType: o.ObservationType, Subject: o.Subject, Value: o.Value, Source: o.Source, Confidence: o.Confidence, Metadata: o.Metadata, Evidence: o.Evidence, ObservedAt: o.ObservedAt})
 			})
 			stop()
 			mu.Lock()
@@ -207,6 +216,12 @@ func (s *Service) execute(run Run, domain string, rules []scope.Rule) {
 	}
 	_ = s.repo.SetRun(context.Background(), run.ID, status, done, failed, "")
 	_ = s.repo.AddEvent(context.Background(), run.TargetID, run.ID, "run_finished", string(status))
+	s.mu.Lock()
+	processor := s.onComplete
+	s.mu.Unlock()
+	if processor != nil && status != Cancelled {
+		_ = processor(context.Background(), Run{ID: run.ID, TargetID: run.TargetID, Status: status})
+	}
 }
 func (s *Service) Cancel(id string) bool {
 	s.mu.Lock()

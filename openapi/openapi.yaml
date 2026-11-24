@@ -25,10 +25,28 @@ paths:
       parameters:
         - {name: type, in: query, schema: {type: string}, description: Optional entity type filter}
         - {name: scopeStatus, in: query, schema: {type: string, enum: [included, excluded, unknown]}, description: Optional scope classification filter}
+        - {name: investigationStatus, in: query, schema: {type: string}, description: Optional investigation-state filter}
+        - {name: q, in: query, schema: {type: string}, description: Search normalized asset values}
       responses: {'200': {description: OK}}
   /api/v1/targets/{id}/entities/{entityId}:
     get: {summary: Inspect an asset including canonical value and metadata, responses: {'200': {description: OK}, '404': {description: Not found}}}
+  /api/v1/targets/{id}/entities/{entityId}/investigation:
+    patch: {summary: Set an asset investigation status or bookmark, responses: {'200': {description: OK}, '400': {description: Validation error}}}
+  /api/v1/targets/{id}/entities/{entityId}/relationships:
+    get: {summary: List bounded evidence-backed relationships for an asset, responses: {'200': {description: OK}}}
+  /api/v1/targets/{id}/entities/{entityId}/observations:
+    get: {summary: List observation history for an asset, responses: {'200': {description: OK}}}
+  /api/v1/targets/{id}/graph:
+    get: {summary: Return a bounded graph neighborhood for entityId, responses: {'200': {description: OK}, '400': {description: entityId required}}}
+  /api/v1/targets/{id}/relationships:
+    post: {summary: Create an evidence-rationalized manual relationship or hypothesis, responses: {'201': {description: Created}, '400': {description: Validation error}}}
   /api/v1/targets/{id}/observations:
     get: {summary: List target observations, responses: {'200': {description: OK}}}
+    post: {summary: Create a manual observation, responses: {'201': {description: Created}, '400': {description: Validation error}}}
+  /api/v1/targets/{id}/snapshots:
+    get: {summary: List target snapshots, responses: {'200': {description: OK}}}
+    post: {summary: Create a named manual snapshot, responses: {'201': {description: Created}}}
+  /api/v1/targets/{id}/snapshots/compare:
+    get: {summary: Compare two target snapshots using from and to query parameters, responses: {'200': {description: OK}}}
   /api/v1/targets/{id}/evidence/{evidenceId}:
     get: {summary: Retrieve retained, unexecuted evidence content and provenance, responses: {'200': {description: OK}, '404': {description: Not found}}}

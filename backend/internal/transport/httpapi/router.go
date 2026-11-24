@@ -1,12 +1,15 @@
 package httpapi
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/atlas/atlas/backend/internal/collection"
+	"github.com/atlas/atlas/backend/internal/correlation"
 	"github.com/atlas/atlas/backend/internal/investigation"
+	"github.com/atlas/atlas/backend/internal/observation"
 	"github.com/atlas/atlas/backend/internal/scope"
 	"github.com/atlas/atlas/backend/internal/target"
 	"log/slog"
@@ -17,18 +20,23 @@ import (
 )
 
 type API struct {
-	db      *sql.DB
-	targets *target.Service
-	scopes  *scope.Repository
-	notes   *investigation.Repository
-	runs    *collection.Service
-	log     *slog.Logger
+	db          *sql.DB
+	targets     *target.Service
+	scopes      *scope.Repository
+	notes       *investigation.Repository
+	ingest      *observation.Ingestor
+	runs        *collection.Service
+	correlation *correlation.Service
+	log         *slog.Logger
 }
 
 func New(db *sql.DB, log *slog.Logger) http.Handler {
 	sc := scope.NewRepository(db)
 	tr := target.NewRepository(db)
-	api := &API{db: db, targets: target.NewService(db, tr, sc), scopes: sc, notes: investigation.NewRepository(db), runs: collection.NewService(db, []collection.Collector{collection.DNSCollector{}, collection.HTTPMetadataCollector{}, collection.TLSCollector{}, collection.CTCollector{}}), log: log}
+	runs := collection.NewService(db, []collection.Collector{collection.DNSCollector{}, collection.HTTPMetadataCollector{}, collection.TLSCollector{}, collection.CTCollector{}})
+	corr := correlation.NewService(db)
+	runs.SetCompletionProcessor(func(ctx context.Context, run collection.Run) error { return corr.QueueRun(ctx, run.TargetID, run.ID) })
+	api := &API{db: db, targets: target.NewService(db, tr, sc), scopes: sc, notes: investigation.NewRepository(db), ingest: observation.NewIngestor(db, sc), runs: runs, correlation: corr, log: log}
 	return api.routes()
 }
 func (a *API) routes() http.Handler {
@@ -50,7 +58,18 @@ func (a *API) routes() http.Handler {
 	m.HandleFunc("POST /api/v1/runs/{id}/cancel", a.cancelRun)
 	m.HandleFunc("GET /api/v1/runs/{id}/events", a.runEvents)
 	m.HandleFunc("GET /api/v1/targets/{id}/entities", a.listEntities)
+	m.HandleFunc("GET /api/v1/targets/{id}/entities/search", a.listEntities)
 	m.HandleFunc("GET /api/v1/targets/{id}/entities/{entityId}", a.getEntity)
+	m.HandleFunc("PATCH /api/v1/targets/{id}/entities/{entityId}/investigation", a.updateEntityInvestigation)
+	m.HandleFunc("GET /api/v1/targets/{id}/entities/{entityId}/relationships", a.entityRelationships)
+	m.HandleFunc("GET /api/v1/targets/{id}/entities/{entityId}/observations", a.entityObservations)
+	m.HandleFunc("POST /api/v1/targets/{id}/entities/{entityId}/tags", a.addEntityTag)
+	m.HandleFunc("GET /api/v1/targets/{id}/graph", a.graph)
+	m.HandleFunc("POST /api/v1/targets/{id}/observations", a.createManualObservation)
+	m.HandleFunc("POST /api/v1/targets/{id}/relationships", a.createManualRelationship)
+	m.HandleFunc("GET /api/v1/targets/{id}/snapshots", a.listSnapshots)
+	m.HandleFunc("POST /api/v1/targets/{id}/snapshots", a.createSnapshot)
+	m.HandleFunc("GET /api/v1/targets/{id}/snapshots/compare", a.compareSnapshots)
 	m.HandleFunc("GET /api/v1/targets/{id}/observations", a.listObservations)
 	m.HandleFunc("GET /api/v1/targets/{id}/evidence/{evidenceId}", a.getEvidence)
 	return middleware(m, a.log)
@@ -341,7 +360,15 @@ func (a *API) listEntities(w http.ResponseWriter, r *http.Request) {
 	}
 	typ := r.URL.Query().Get("type")
 	status := r.URL.Query().Get("scopeStatus")
-	q := "SELECT id,type,canonical_value,display_value,scope_status,first_seen_at,last_seen_at FROM entities WHERE target_id=?"
+	investigationStatus := r.URL.Query().Get("investigationStatus")
+	search := strings.TrimSpace(r.URL.Query().Get("q"))
+	cursor := r.URL.Query().Get("cursor")
+	limit, e := boundedLimit(r, 50)
+	if e != nil {
+		fail(w, 400, "validation_failed", e.Error())
+		return
+	}
+	q := "SELECT id,type,canonical_value,display_value,scope_status,first_seen_at,last_seen_at,investigation_status,bookmarked FROM entities WHERE target_id=?"
 	args := []any{r.PathValue("id")}
 	if typ != "" {
 		q += " AND type=?"
@@ -351,7 +378,21 @@ func (a *API) listEntities(w http.ResponseWriter, r *http.Request) {
 		q += " AND scope_status=?"
 		args = append(args, status)
 	}
-	q += " ORDER BY last_seen_at DESC LIMIT 100"
+	if investigationStatus != "" {
+		q += " AND investigation_status=?"
+		args = append(args, investigationStatus)
+	}
+	if search != "" {
+		q += " AND (lower(canonical_value) LIKE ? OR lower(display_value) LIKE ? OR id IN (SELECT entity_id FROM entity_search WHERE entity_search MATCH ?))"
+		like := "%" + strings.ToLower(search) + "%"
+		args = append(args, like, like, `"`+strings.ReplaceAll(search, `"`, "")+`"`)
+	}
+	if cursor != "" {
+		q += " AND last_seen_at<?"
+		args = append(args, cursor)
+	}
+	q += " ORDER BY last_seen_at DESC LIMIT ?"
+	args = append(args, limit+1)
 	rows, e := a.db.QueryContext(r.Context(), q, args...)
 	if e != nil {
 		fail(w, 500, "internal_error", "could not list entities")
@@ -359,22 +400,31 @@ func (a *API) listEntities(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 	out := []map[string]any{}
+	nextCursor := ""
+	lastCursor := ""
 	for rows.Next() {
-		var id, t, c, d, s, first, last string
-		if e = rows.Scan(&id, &t, &c, &d, &s, &first, &last); e != nil {
+		var id, t, c, d, s, first, last, investigation string
+		var bookmarked int
+		if e = rows.Scan(&id, &t, &c, &d, &s, &first, &last, &investigation, &bookmarked); e != nil {
 			fail(w, 500, "internal_error", "could not read entity")
 			return
 		}
-		out = append(out, map[string]any{"id": id, "type": t, "canonicalValue": c, "displayValue": d, "scopeStatus": s, "firstSeenAt": first, "lastSeenAt": last})
+		if len(out) == limit {
+			nextCursor = lastCursor
+			break
+		}
+		out = append(out, map[string]any{"id": id, "type": t, "canonicalValue": c, "displayValue": d, "scopeStatus": s, "firstSeenAt": first, "lastSeenAt": last, "investigationStatus": investigation, "bookmarked": bookmarked == 1})
+		lastCursor = last
 	}
-	write(w, 200, map[string]any{"data": out})
+	write(w, 200, map[string]any{"data": out, "nextCursor": nextCursor})
 }
 func (a *API) getEntity(w http.ResponseWriter, r *http.Request) {
 	if !a.ensureTarget(w, r) {
 		return
 	}
-	var id, t, c, d, s, metadata, first, last string
-	e := a.db.QueryRowContext(r.Context(), "SELECT id,type,canonical_value,display_value,scope_status,metadata_json,first_seen_at,last_seen_at FROM entities WHERE target_id=? AND id=?", r.PathValue("id"), r.PathValue("entityId")).Scan(&id, &t, &c, &d, &s, &metadata, &first, &last)
+	var id, t, c, d, s, metadata, first, last, investigation string
+	var bookmarked int
+	e := a.db.QueryRowContext(r.Context(), "SELECT id,type,canonical_value,display_value,scope_status,metadata_json,first_seen_at,last_seen_at,investigation_status,bookmarked FROM entities WHERE target_id=? AND id=?", r.PathValue("id"), r.PathValue("entityId")).Scan(&id, &t, &c, &d, &s, &metadata, &first, &last, &investigation, &bookmarked)
 	if errors.Is(e, sql.ErrNoRows) {
 		fail(w, 404, "not_found", "entity not found")
 		return
@@ -383,7 +433,7 @@ func (a *API) getEntity(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, "internal_error", "could not load entity")
 		return
 	}
-	write(w, 200, map[string]any{"id": id, "type": t, "canonicalValue": c, "displayValue": d, "scopeStatus": s, "metadata": json.RawMessage(metadata), "firstSeenAt": first, "lastSeenAt": last})
+	write(w, 200, map[string]any{"id": id, "type": t, "canonicalValue": c, "displayValue": d, "scopeStatus": s, "metadata": json.RawMessage(metadata), "firstSeenAt": first, "lastSeenAt": last, "investigationStatus": investigation, "bookmarked": bookmarked == 1})
 }
 func (a *API) listObservations(w http.ResponseWriter, r *http.Request) {
 	if !a.ensureTarget(w, r) {

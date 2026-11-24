@@ -2,7 +2,9 @@ package collection
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,13 +20,15 @@ import (
 )
 
 type Observation struct {
-	EntityType string
-	Value      string
-	Source     string
-	Confidence float64
-	Metadata   string
-	Evidence   string
-	ObservedAt time.Time
+	EntityType      string
+	ObservationType string
+	Subject         string
+	Value           string
+	Source          string
+	Confidence      float64
+	Metadata        string
+	Evidence        string
+	ObservedAt      time.Time
 }
 type Request struct {
 	TargetID, PrimaryDomain string
@@ -59,7 +63,7 @@ func (c DNSCollector) Collect(ctx context.Context, r Request, emit func(Observat
 		return fmt.Errorf("lookup %s: %w", r.PrimaryDomain, err)
 	}
 	for _, ip := range ips {
-		if err := emit(Observation{EntityType: "ip_address", Value: ip.String(), Source: c.Name(), Confidence: 1, ObservedAt: time.Now().UTC(), Metadata: `{"record_type":"A_or_AAAA"}`}); err != nil {
+		if err := emit(Observation{EntityType: "ip_address", ObservationType: "dns_resolution", Subject: r.PrimaryDomain, Value: ip.String(), Source: c.Name(), Confidence: 1, ObservedAt: time.Now().UTC(), Metadata: `{"record_type":"A_or_AAAA"}`}); err != nil {
 			return err
 		}
 	}
@@ -120,12 +124,12 @@ func (c HTTPMetadataCollector) Collect(ctx context.Context, r Request, emit func
 	defer resp.Body.Close()
 	server := strings.TrimSpace(resp.Header.Get("Server"))
 	if server != "" {
-		if err := emit(Observation{EntityType: "technology", Value: server, Source: c.Name(), Confidence: 1, ObservedAt: time.Now().UTC(), Metadata: `{"header":"Server","classification":"confirmed"}`}); err != nil {
+		if err := emit(Observation{EntityType: "technology", ObservationType: "http_technology", Subject: r.PrimaryDomain, Value: server, Source: c.Name(), Confidence: 1, ObservedAt: time.Now().UTC(), Metadata: `{"header":"Server","classification":"confirmed"}`}); err != nil {
 			return err
 		}
 	}
 	if powered := strings.TrimSpace(resp.Header.Get("X-Powered-By")); powered != "" {
-		if err := emit(Observation{EntityType: "technology", Value: powered, Source: c.Name(), Confidence: .7, ObservedAt: time.Now().UTC(), Metadata: `{"header":"X-Powered-By","classification":"inferred"}`}); err != nil {
+		if err := emit(Observation{EntityType: "technology", ObservationType: "http_technology", Subject: r.PrimaryDomain, Value: powered, Source: c.Name(), Confidence: .7, ObservedAt: time.Now().UTC(), Metadata: `{"header":"X-Powered-By","classification":"inferred"}`}); err != nil {
 			return err
 		}
 	}
@@ -135,11 +139,11 @@ func (c HTTPMetadataCollector) Collect(ctx context.Context, r Request, emit func
 		return fmt.Errorf("read bounded response metadata: %w", readErr)
 	}
 	if match := regexp.MustCompile(`(?i)<meta[^>]+name=["']generator["'][^>]+content=["']([^"']+)`).FindSubmatch(body); len(match) == 2 {
-		if err := emit(Observation{EntityType: "technology", Value: string(match[1]), Source: c.Name(), Confidence: .7, ObservedAt: time.Now().UTC(), Metadata: `{"source":"meta_generator","classification":"inferred"}`}); err != nil {
+		if err := emit(Observation{EntityType: "technology", ObservationType: "http_technology", Subject: r.PrimaryDomain, Value: string(match[1]), Source: c.Name(), Confidence: .7, ObservedAt: time.Now().UTC(), Metadata: `{"source":"meta_generator","classification":"inferred"}`}); err != nil {
 			return err
 		}
 	}
-	return emit(Observation{EntityType: "url", Value: u.String(), Source: c.Name(), Confidence: 1, ObservedAt: time.Now().UTC(), Metadata: fmt.Sprintf(`{"status":%d}`, resp.StatusCode)})
+	return emit(Observation{EntityType: "url", ObservationType: "http_endpoint", Subject: r.PrimaryDomain, Value: u.String(), Source: c.Name(), Confidence: 1, ObservedAt: time.Now().UTC(), Metadata: fmt.Sprintf(`{"status":%d}`, resp.StatusCode)})
 }
 
 type resolverAdapter struct{ lookup DNSLookup }
@@ -178,8 +182,9 @@ func (c TLSCollector) Collect(ctx context.Context, r Request, emit func(Observat
 		return err
 	}
 	cert := conn.ConnectionState().PeerCertificates[0]
+	fingerprint := sha256.Sum256(cert.Raw)
 	meta, _ := json.Marshal(map[string]any{"issuer": cert.Issuer.String(), "not_before": cert.NotBefore.UTC().Format(time.RFC3339), "not_after": cert.NotAfter.UTC().Format(time.RFC3339), "dns_names": cert.DNSNames})
-	return emit(Observation{EntityType: "certificate", Value: cert.SerialNumber.String(), Source: c.Name(), Confidence: 1, Metadata: string(meta), ObservedAt: time.Now().UTC()})
+	return emit(Observation{EntityType: "certificate", ObservationType: "tls_certificate", Subject: r.PrimaryDomain, Value: hex.EncodeToString(fingerprint[:]), Source: c.Name(), Confidence: 1, Metadata: string(meta), ObservedAt: time.Now().UTC()})
 }
 
 // CTCollector is registered for passive collection. Its HTTP client is injected for fixture-backed tests.
@@ -240,7 +245,7 @@ func (c CTCollector) Collect(ctx context.Context, r Request, emit func(Observati
 			if host == r.PrimaryDomain {
 				kind = "domain"
 			}
-			if err := emit(Observation{EntityType: kind, Value: host, Source: c.Name(), Confidence: 1, Metadata: `{"classification":"observed"}`, ObservedAt: time.Now().UTC()}); err != nil {
+			if err := emit(Observation{EntityType: kind, ObservationType: "certificate_transparency", Subject: r.PrimaryDomain, Value: host, Source: c.Name(), Confidence: 1, Metadata: `{"classification":"observed"}`, ObservedAt: time.Now().UTC()}); err != nil {
 				return err
 			}
 		}
