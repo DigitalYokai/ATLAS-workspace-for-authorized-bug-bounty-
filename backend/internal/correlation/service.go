@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"net/url"
 	"strings"
 	"time"
 
@@ -244,10 +245,24 @@ func canonical(typ, value string) (string, error) {
 	switch typ {
 	case "domain", "subdomain":
 		return scope.NormalizeHost(v)
+	case "ip_address":
+		ip := net.ParseIP(v)
+		if ip == nil {
+			return "", fmt.Errorf("invalid IP address")
+		}
+		return ip.String(), nil
 	case "url":
-		// Existing ingestion guarantees a non-empty URL; correlation keeps a
-		// stable, conservative key without attempting fuzzy URL matching.
-		return strings.ToLower(strings.TrimSuffix(v, "#")), nil
+		u, err := url.Parse(v)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return "", fmt.Errorf("invalid URL")
+		}
+		u.Scheme = strings.ToLower(u.Scheme)
+		u.Host = strings.ToLower(u.Host)
+		u.Fragment = ""
+		if (u.Scheme == "http" && u.Port() == "80") || (u.Scheme == "https" && u.Port() == "443") {
+			u.Host = u.Hostname()
+		}
+		return u.String(), nil
 	default:
 		return strings.ToLower(strings.Join(strings.Fields(v), " ")), nil
 	}

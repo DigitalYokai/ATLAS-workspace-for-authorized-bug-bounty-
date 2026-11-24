@@ -82,3 +82,31 @@ func TestSnapshotComparisonReportsNewEntities(t *testing.T) {
 		t.Fatalf("new entities=%#v", comparison.NewEntityIDs)
 	}
 }
+
+func TestAutomaticSnapshotRejectsIncompleteRun(t *testing.T) {
+	db := setupCorrelationDB(t)
+	if _, err := db.Exec("UPDATE collection_runs SET status='partially_completed' WHERE id='run'"); err != nil {
+		t.Fatal(err)
+	}
+	err := (&Service{db: db}).CreateAutomaticSnapshot(context.Background(), "target", "run")
+	if err == nil {
+		t.Fatal("expected incomplete run to be rejected")
+	}
+	var snapshots int
+	if err := db.QueryRow("SELECT count(*) FROM snapshots").Scan(&snapshots); err != nil {
+		t.Fatal(err)
+	}
+	if snapshots != 0 {
+		t.Fatalf("snapshots=%d, want 0", snapshots)
+	}
+}
+
+func TestCanonicalNormalizesURLsAndRejectsInvalidIPs(t *testing.T) {
+	got, err := canonical("url", "HTTPS://Example.COM:443/path#fragment")
+	if err != nil || got != "https://example.com/path" {
+		t.Fatalf("URL canonical=%q err=%v", got, err)
+	}
+	if _, err := canonical("ip_address", "not-an-ip"); err == nil {
+		t.Fatal("invalid IP was accepted")
+	}
+}

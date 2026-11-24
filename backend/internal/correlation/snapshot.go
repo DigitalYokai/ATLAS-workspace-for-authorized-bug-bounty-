@@ -29,6 +29,13 @@ type Comparison struct {
 }
 
 func (s *Service) CreateAutomaticSnapshot(ctx context.Context, targetID, runID string) error {
+	var status string
+	if err := s.db.QueryRowContext(ctx, "SELECT status FROM collection_runs WHERE id=? AND target_id=?", runID, targetID).Scan(&status); err != nil {
+		return err
+	}
+	if status != "completed" {
+		return fmt.Errorf("automatic snapshots require a completed collection run")
+	}
 	return s.createSnapshot(ctx, targetID, &runID, "", "automatic")
 }
 

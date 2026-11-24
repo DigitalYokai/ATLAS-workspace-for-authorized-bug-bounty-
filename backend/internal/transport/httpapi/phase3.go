@@ -190,6 +190,34 @@ func (a *API) addEntityTag(w http.ResponseWriter, r *http.Request) {
 	write(w, 201, map[string]string{"id": tagID, "name": strings.TrimSpace(input.Name)})
 }
 
+func (a *API) listEntityTags(w http.ResponseWriter, r *http.Request) {
+	if !a.ensureTarget(w, r) {
+		return
+	}
+	rows, err := a.db.QueryContext(r.Context(), `SELECT tags.id,tags.name,tags.color
+		FROM entity_tags JOIN tags ON tags.id=entity_tags.tag_id
+		WHERE entity_tags.target_id=? AND entity_tags.entity_id=? ORDER BY tags.name`, r.PathValue("id"), r.PathValue("entityId"))
+	if err != nil {
+		fail(w, 500, "internal_error", "could not list entity tags")
+		return
+	}
+	defer rows.Close()
+	out := []map[string]string{}
+	for rows.Next() {
+		var id, name, color string
+		if err := rows.Scan(&id, &name, &color); err != nil {
+			fail(w, 500, "internal_error", "could not read entity tag")
+			return
+		}
+		out = append(out, map[string]string{"id": id, "name": name, "color": color})
+	}
+	if err := rows.Err(); err != nil {
+		fail(w, 500, "internal_error", "could not list entity tags")
+		return
+	}
+	write(w, 200, map[string]any{"data": out})
+}
+
 func (a *API) graph(w http.ResponseWriter, r *http.Request) {
 	if !a.ensureTarget(w, r) {
 		return

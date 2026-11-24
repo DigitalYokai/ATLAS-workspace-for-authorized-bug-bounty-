@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"net"
+	"net/url"
 	"strings"
 	"time"
 
@@ -32,6 +34,26 @@ func canonical(kind, value string) (string, error) {
 	}
 	if v == "" {
 		return "", fmt.Errorf("empty entity value")
+	}
+	if kind == "ip_address" {
+		ip := net.ParseIP(v)
+		if ip == nil {
+			return "", fmt.Errorf("invalid IP address")
+		}
+		return ip.String(), nil
+	}
+	if kind == "url" {
+		u, err := url.Parse(v)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return "", fmt.Errorf("invalid URL")
+		}
+		u.Scheme = strings.ToLower(u.Scheme)
+		u.Host = strings.ToLower(u.Host)
+		u.Fragment = ""
+		if (u.Scheme == "http" && u.Port() == "80") || (u.Scheme == "https" && u.Port() == "443") {
+			u.Host = u.Hostname()
+		}
+		return u.String(), nil
 	}
 	return strings.ToLower(v), nil
 }

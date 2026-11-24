@@ -63,6 +63,7 @@ func (a *API) routes() http.Handler {
 	m.HandleFunc("PATCH /api/v1/targets/{id}/entities/{entityId}/investigation", a.updateEntityInvestigation)
 	m.HandleFunc("GET /api/v1/targets/{id}/entities/{entityId}/relationships", a.entityRelationships)
 	m.HandleFunc("GET /api/v1/targets/{id}/entities/{entityId}/observations", a.entityObservations)
+	m.HandleFunc("GET /api/v1/targets/{id}/entities/{entityId}/tags", a.listEntityTags)
 	m.HandleFunc("POST /api/v1/targets/{id}/entities/{entityId}/tags", a.addEntityTag)
 	m.HandleFunc("GET /api/v1/targets/{id}/graph", a.graph)
 	m.HandleFunc("POST /api/v1/targets/{id}/observations", a.createManualObservation)
@@ -362,6 +363,10 @@ func (a *API) listEntities(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("scopeStatus")
 	investigationStatus := r.URL.Query().Get("investigationStatus")
 	search := strings.TrimSpace(r.URL.Query().Get("q"))
+	tag := strings.TrimSpace(r.URL.Query().Get("tag"))
+	technology := strings.TrimSpace(r.URL.Query().Get("technology"))
+	observedAfter := strings.TrimSpace(r.URL.Query().Get("observedAfter"))
+	minConfidence := strings.TrimSpace(r.URL.Query().Get("minConfidence"))
 	cursor := r.URL.Query().Get("cursor")
 	limit, e := boundedLimit(r, 50)
 	if e != nil {
@@ -386,6 +391,31 @@ func (a *API) listEntities(w http.ResponseWriter, r *http.Request) {
 		q += " AND (lower(canonical_value) LIKE ? OR lower(display_value) LIKE ? OR id IN (SELECT entity_id FROM entity_search WHERE entity_search MATCH ?))"
 		like := "%" + strings.ToLower(search) + "%"
 		args = append(args, like, like, `"`+strings.ReplaceAll(search, `"`, "")+`"`)
+	}
+	if tag != "" {
+		q += " AND EXISTS (SELECT 1 FROM entity_tags et JOIN tags tg ON tg.id=et.tag_id WHERE et.entity_id=entities.id AND tg.target_id=entities.target_id AND lower(tg.name)=lower(?))"
+		args = append(args, tag)
+	}
+	if technology != "" {
+		q += " AND EXISTS (SELECT 1 FROM relationships rt JOIN entities tech ON tech.id=rt.destination_entity_id WHERE rt.target_id=entities.target_id AND rt.source_entity_id=entities.id AND rt.relationship_type='USES_TECHNOLOGY' AND lower(tech.canonical_value)=lower(?))"
+		args = append(args, technology)
+	}
+	if observedAfter != "" {
+		if _, err := time.Parse(time.RFC3339, observedAfter); err != nil {
+			fail(w, 400, "validation_failed", "observedAfter must be RFC3339")
+			return
+		}
+		q += " AND last_seen_at>=?"
+		args = append(args, observedAfter)
+	}
+	if minConfidence != "" {
+		confidence, err := strconv.ParseFloat(minConfidence, 64)
+		if err != nil || confidence < 0 || confidence > 1 {
+			fail(w, 400, "validation_failed", "minConfidence must be between 0 and 1")
+			return
+		}
+		q += " AND EXISTS (SELECT 1 FROM relationships rc WHERE rc.target_id=entities.target_id AND (rc.source_entity_id=entities.id OR rc.destination_entity_id=entities.id) AND rc.confidence>=?)"
+		args = append(args, confidence)
 	}
 	if cursor != "" {
 		q += " AND last_seen_at<?"
@@ -439,7 +469,7 @@ func (a *API) listObservations(w http.ResponseWriter, r *http.Request) {
 	if !a.ensureTarget(w, r) {
 		return
 	}
-	rows, e := a.db.QueryContext(r.Context(), "SELECT id,collector,observation_type,subject,value,source,evidence_id,observed_at,confidence,raw_metadata_json FROM observations WHERE target_id=? ORDER BY observed_at DESC LIMIT 100", r.PathValue("id"))
+	rows, e := a.db.QueryContext(r.Context(), "SELECT id,collector,observation_type,subject,value,source,evidence_id,observed_at,confidence,raw_metadata_json,origin FROM observations WHERE target_id=? ORDER BY observed_at DESC LIMIT 100", r.PathValue("id"))
 	if e != nil {
 		fail(w, 500, "internal_error", "could not list observations")
 		return
@@ -447,10 +477,10 @@ func (a *API) listObservations(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	out := []map[string]any{}
 	for rows.Next() {
-		var id, c, t, subject, value, source, metadata, observed string
+		var id, c, t, subject, value, source, metadata, observed, origin string
 		var evidence sql.NullString
 		var confidence float64
-		if e = rows.Scan(&id, &c, &t, &subject, &value, &source, &evidence, &observed, &confidence, &metadata); e != nil {
+		if e = rows.Scan(&id, &c, &t, &subject, &value, &source, &evidence, &observed, &confidence, &metadata, &origin); e != nil {
 			fail(w, 500, "internal_error", "could not read observation")
 			return
 		}
@@ -458,7 +488,7 @@ func (a *API) listObservations(w http.ResponseWriter, r *http.Request) {
 		if evidence.Valid {
 			evidenceID = evidence.String
 		}
-		out = append(out, map[string]any{"id": id, "collector": c, "observationType": t, "subject": subject, "value": value, "source": source, "evidenceId": evidenceID, "observedAt": observed, "confidence": confidence, "metadata": json.RawMessage(metadata)})
+		out = append(out, map[string]any{"id": id, "collector": c, "observationType": t, "subject": subject, "value": value, "source": source, "evidenceId": evidenceID, "observedAt": observed, "confidence": confidence, "metadata": json.RawMessage(metadata), "origin": origin})
 	}
 	write(w, 200, map[string]any{"data": out})
 }
